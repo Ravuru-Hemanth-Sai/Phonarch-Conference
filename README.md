@@ -52,7 +52,39 @@ A workspace is the SaaS tenant boundary. Every customer-facing object is scoped 
 
 The authenticated API session carries the workspace ID. The API does not trust an arbitrary `X-Workspace-ID` header for customer authorization. Every read, write, action, and room command adds the session workspace predicate. A future workspace switch must re-issue a session only after checking `workspace_members`.
 
-The seeded local workspace is `Operations`. It exists so the current admin can log in immediately. The UI currently presents that default workspace, while the API and database already enforce the tenant boundary needed for a workspace switcher and RBAC expansion.
+The seeded local workspace is `Operations`. It exists so the current product administrator can log in immediately. Customer operators only see workspaces granted through `workspace_members`; the API and database enforce the tenant boundary for every workspace-scoped read and write.
+
+### Product administration and access
+
+Product administration is a separate control surface at `/admin`. It is for the
+platform owner and platform administrators only; it is not part of the customer
+workspace navigation. There is deliberately no public signup route. A platform
+administrator creates customer operator accounts, assigns them to workspaces,
+sets their workspace role, and can suspend or reactivate them.
+
+The product admin console manages the platform-wide inventory and policy that a
+customer operator must not control:
+
+- workspaces and their maximum participant policy;
+- workspace membership and roles (`OWNER`, `ADMIN`, `OPERATOR`, `VIEWER`);
+- rooms across all workspaces and each room's participant limit;
+- telephony numbers (TFNs), scoped to exactly one workspace;
+- the one-room assignment of an active TFN; and
+- platform users and their platform role.
+
+TFNs are not global caller-ID values. A TFN belongs to one workspace and may be
+assigned to one room in that workspace. The room settings page displays the
+assigned TFN and the room start gate requires all of the following: a fixed host,
+an active TFN assigned by product administration, and a roster within the room
+participant limit. A failed prerequisite is returned as a structured `409`
+response and shown as an actionable warning in the room UI. The selected TFN is
+also passed as caller ID to the sidecar originate command.
+
+Platform admin passwords are stored as bcrypt hashes in PostgreSQL. The lab
+bootstrap credentials come from the ignored environment file under
+`/data/state/secrets`; they are not committed to the repository. The bootstrap
+admin is synchronized on startup so a fresh lab remains recoverable, while
+customer users authenticate only through their active database operator record.
 
 ### Room isolation
 
@@ -262,6 +294,7 @@ The migrations are applied by `/data/deploy/scripts/init-db.sh`:
 - `003_multitenant_media_ha.sql`: workspaces, workspace membership, workspace foreign keys, media sessions, leaf assignments, speaker requests, room events, epochs, and command metadata;
 - `004_room_lifecycle_roster.sql`: room state, one fixed host, listener roles, durable room sessions, and per-session participant snapshots.
 - `005_room_dialing_region.sql`: room-level default dialing region with a constrained supported-region set.
+- `006_product_admin_control.sql`: platform roles/status, workspace participant limits, workspace-scoped TFNs, room TFN assignment, and room limits.
 
 Important relationships:
 
@@ -332,6 +365,13 @@ The API owns authenticated customer operations:
 - speaker request queue, grant, and withdraw;
 - internal DTMF and sidecar event ingestion.
 
+The platform-admin surface is separate from those customer operations:
+
+- `GET /api/v1/auth/me` returns the authenticated operator identity and platform-admin flag;
+- `/api/v1/admin/*` is protected by `PLATFORM_OWNER`/`PLATFORM_ADMIN` authorization;
+- admin endpoints manage workspaces, rooms, TFNs, users, and workspace membership;
+- no customer-facing endpoint creates an account or bypasses workspace membership.
+
 The API binds to localhost by default. If it is exposed beyond the host, configure a real TLS/reverse-proxy boundary, a non-empty `PHONARCH_INTERNAL_TOKEN`, an explicit `UI_ORIGIN`, rate limits, and production identity/RBAC. The scaffold's admin username/password are lab credentials only.
 
 ### UI: `/data/components/phonarch-platform-web`
@@ -339,6 +379,7 @@ The API binds to localhost by default. If it is exposed beyond the host, configu
 The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icons. It contains:
 
 - workspace landing page with room cards and room deletion confirmation;
+- separate `/admin` product console for platform owners/admins, with workspace, room, TFN, user, and membership management;
 - fixed host editor and editable participant roster;
 - direct SIP dialer plus live floating ad-hoc dialer;
 - room-scoped dialing region selection with `+91` as the default and live number normalization;
@@ -502,7 +543,7 @@ curl http://127.0.0.1:3000/login
 /data/toolchains/redis/usr/bin/redis-cli --scan --pattern 'active-pbx:*'
 ```
 
-The lab admin credentials come from `/data/state/secrets/phonarch-conference.env`, not from the source code. Change them before any shared deployment.
+The lab admin credentials come from `/data/state/secrets/phonarch-conference.env`, not from the source code. Change them before any shared deployment. The customer-facing login has no self-signup link; customer accounts are provisioned from the product admin console.
 
 ## Production work remaining
 
@@ -515,7 +556,7 @@ The following items are intentionally called out instead of being hidden behind 
 5. Move sidecar call/command state to a durable command outbox and add a DB-to-PBX reconciler.
 6. Populate heartbeat telemetry from real RTP, CPU, memory, NIC, and RustPBX counters.
 7. Add RFC 4733 DTMF normalization and test INFO/telephone-event behavior against every carrier.
-8. Add RBAC, workspace creation/switching, secret rotation, audit retention, and rate limits.
+8. Add finer-grained customer RBAC, workspace switching, secret rotation, audit retention, and rate limits. The first platform-admin gate and workspace membership model are implemented; production still needs policy review and audit hardening.
 9. Add Redis HA and PostgreSQL HA/backups/PITR.
 10. Run SIP/RTP load, failure, NAT, packet-loss, root-split-brain, carrier-reINVITE, and long-duration tests before a 10k capacity claim.
 

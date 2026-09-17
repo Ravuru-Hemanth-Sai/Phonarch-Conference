@@ -47,7 +47,9 @@ const API = process.env.NEXT_PUBLIC_CONTROL_API_URL || "";
 type View = "rooms" | "room" | "dialer" | "bulk" | "activity" | "settings";
 type RoomTab = "live" | "dialer" | "bulk" | "activity" | "settings";
 type DialRegion = { code: string; label: string };
-type Bridge = { id: string; name: string; status: string; room_state?: string; host_name?: string; host_phone?: string; default_region?: string; created_at?: string };
+type StartCheck = { key: string; label: string; ok: boolean; detail: string };
+type RoomTFN = { id: string; number: string; label: string };
+type Bridge = { id: string; name: string; status: string; room_state?: string; host_name?: string; host_phone?: string; default_region?: string; participant_limit?: number; tfn_id?: string; tfn_number?: string; tfn_label?: string; created_at?: string };
 type Participant = {
   participant_id: string;
   name: string;
@@ -68,7 +70,8 @@ type SpeakerRequest = {
 };
 type SessionParticipant = { participant_id?: string; name: string; phone_number: string; role: string; state: string; joined_at?: string; left_at?: string };
 type SessionSummary = { session_id: string; status: string; started_at?: string; ended_at?: string; duration_seconds?: number; participants: SessionParticipant[] };
-type RoomState = { workspace_id?: string; bridge_id: string; room_state?: string; default_region?: string; host?: { name: string; phone_number: string }; participants: Participant[]; speaker_requests?: SpeakerRequest[]; sessions?: SessionSummary[] };
+type RoomState = { workspace_id?: string; bridge_id: string; room_state?: string; default_region?: string; participant_limit?: number; tfn?: RoomTFN; start_ready?: boolean; start_checks?: StartCheck[]; host?: { name: string; phone_number: string }; participants: Participant[]; speaker_requests?: SpeakerRequest[]; sessions?: SessionSummary[] };
+type AuthMe = { username: string; display_name: string; platform_admin: boolean; workspace?: { id: string; slug: string; name: string; status: string } };
 type Contact = { name: string; phone_number: string; role: string; valid: boolean; reason?: string };
 type Notice = { tone: "success" | "error"; message: string } | null;
 
@@ -171,9 +174,9 @@ function WorkspaceSwitcher({ onSettings }: { onSettings: () => void }) {
   return <div className="workspace-switcher"><button type="button" className={`workspace-trigger ${open ? "open" : ""}`} onClick={() => setOpen((current) => !current)} aria-haspopup="menu" aria-expanded={open}><span className="workspace-trigger-mark">OP</span><span className="workspace-trigger-copy"><small>Workspace</small><strong>Operations</strong></span><ChevronDown size={14} className="workspace-trigger-chevron" /></button>{open && <div className="workspace-popover" role="menu"><div className="workspace-popover-heading"><strong>Current workspace</strong><kbd>Esc</kbd></div><div className="workspace-current"><span className="workspace-option-mark">OP</span><span className="workspace-option-copy"><strong>Operations</strong><small>Conference workspace</small></span><Check size={15} /></div><button type="button" className="workspace-create" onClick={() => { setOpen(false); onSettings(); }}><Settings size={14} /><span>Workspace settings</span><ChevronRight size={13} /></button></div>}</div>;
 }
 
-function TopBar({ view, room, userName, onNavigate, onLogout, onRefresh }: { view: View; room?: Bridge; userName: string; onNavigate: (view: View) => void; onLogout: () => void; onRefresh: () => void }) {
+function TopBar({ view, room, userName, platformAdmin, onNavigate, onLogout, onRefresh }: { view: View; room?: Bridge; userName: string; platformAdmin: boolean; onNavigate: (view: View) => void; onLogout: () => void; onRefresh: () => void }) {
   const pageName = view === "rooms" ? "Conference rooms" : view === "room" ? room?.name || "Room operations" : view === "dialer" ? "Direct dialer" : view === "bulk" ? "Bulk outreach" : view === "activity" ? "Call activity" : "Workspace settings";
-  return <header className="topbar"><div className="topbar-left"><button type="button" className="topbar-brand" onClick={() => onNavigate("rooms")}><span className="brand-mark"><Sparkles size={16} /></span><span><strong>Phonarch</strong></span></button>{view !== "rooms" && <><div className="breadcrumbs"><button type="button" onClick={() => onNavigate("rooms")}>Workspace</button><ChevronRight size={13} /><span>{pageName}</span></div><span className="topbar-caption">Conference command center</span></>}</div><div className="topbar-actions"><WorkspaceSwitcher onSettings={() => onNavigate("settings")} /><button type="button" className={`topbar-settings ${view === "settings" ? "active" : ""}`} onClick={() => onNavigate("settings")}><Settings size={15} /><span>Settings</span></button><IconButton title="Refresh workspace" onClick={onRefresh}><RefreshCw size={15} /></IconButton><div className="user-chip"><span className="user-avatar">{initials(userName)}</span><span><strong>{userName}</strong><small>Administrator</small></span></div><IconButton title="Sign out" onClick={onLogout}><LogOut size={15} /></IconButton></div></header>;
+  return <header className="topbar"><div className="topbar-left"><button type="button" className="topbar-brand" onClick={() => onNavigate("rooms")}><span className="brand-mark"><Sparkles size={16} /></span><span><strong>Phonarch</strong></span></button>{view !== "rooms" && <><div className="breadcrumbs"><button type="button" onClick={() => onNavigate("rooms")}>Workspace</button><ChevronRight size={13} /><span>{pageName}</span></div><span className="topbar-caption">Conference command center</span></>}</div><div className="topbar-actions"><WorkspaceSwitcher onSettings={() => onNavigate("settings")} />{platformAdmin && <button type="button" className="topbar-settings admin-link" onClick={() => { window.location.href = "/admin"; }}><ShieldCheck size={15} /><span>Admin console</span></button>}<button type="button" className={`topbar-settings ${view === "settings" ? "active" : ""}`} onClick={() => onNavigate("settings")}><Settings size={15} /><span>Settings</span></button><IconButton title="Refresh workspace" onClick={onRefresh}><RefreshCw size={15} /></IconButton><div className="user-chip"><span className="user-avatar">{initials(userName)}</span><span><strong>{userName}</strong><small>{platformAdmin ? "Product administrator" : "Workspace operator"}</small></span></div><IconButton title="Sign out" onClick={onLogout}><LogOut size={15} /></IconButton></div></header>;
 }
 
 export default function Dashboard() {
@@ -189,7 +192,7 @@ export default function Dashboard() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const [roomSidebarCollapsed, setRoomSidebarCollapsed] = useState(false);
-  const [userName] = useState("Admin");
+  const [identity, setIdentity] = useState<AuthMe | null>(null);
 
   const selectedRoom = rooms.find((room) => room.id === selectedRoomId);
   const selectedState = selectedRoomId ? roomStates[selectedRoomId] : undefined;
@@ -209,6 +212,10 @@ export default function Dashboard() {
     } finally {
       setLoading(false);
     }
+  }, [notify]);
+
+  const loadIdentity = useCallback(async () => {
+    try { setIdentity(await request<AuthMe>("/api/v1/auth/me")); } catch (error) { notify(error instanceof Error ? error.message : "Session could not be loaded", "error"); }
   }, [notify]);
 
   const loadRoom = useCallback(async (roomId: string) => {
@@ -233,7 +240,7 @@ export default function Dashboard() {
     });
   }, [rooms]);
 
-  useEffect(() => { void loadRooms(); }, [loadRooms]);
+  useEffect(() => { void loadIdentity(); void loadRooms(); }, [loadIdentity, loadRooms]);
   useEffect(() => {
     if (!rooms.length) return;
     void loadAllRooms();
@@ -316,7 +323,7 @@ export default function Dashboard() {
   return <div className={`app-shell ${view === "room" ? "room-mode" : ""}`}>
     {view === "room" && selectedRoom && <RoomSidebar room={selectedRoom} tab={roomTab} connectedCount={selectedState?.participants.filter(isConnected).length || 0} liveCount={selectedState?.participants.filter(isLive).length || 0} collapsed={roomSidebarCollapsed} onToggle={() => setRoomSidebarCollapsed((value) => !value)} onTab={setRoomTab} onBack={() => navigate("rooms")} />}
     <main className="main-content">
-      <TopBar view={view} room={selectedRoom} userName={userName} onNavigate={navigate} onLogout={() => void logout()} onRefresh={refresh} />
+      <TopBar view={view} room={selectedRoom} userName={identity?.display_name || identity?.username || "Operator"} platformAdmin={Boolean(identity?.platform_admin)} onNavigate={navigate} onLogout={() => void logout()} onRefresh={refresh} />
       {notice && <div className={`notice ${notice.tone}`}><span className="notice-icon">{notice.tone === "success" ? <Check size={14} /> : <AlertCircle size={14} />}</span><span>{notice.message}</span><button type="button" onClick={() => setNotice(null)}><X size={14} /></button></div>}
       {view === "rooms" && <RoomsPage summaries={roomSummaries} onOpenRoom={openRoom} onCreateRoom={() => setCreateOpen(true)} onDeleteRoom={(room) => { setDeleteError(""); setDeleteTarget(room); }} />}
       {view === "room" && selectedRoom && <RoomPage room={selectedRoom} state={selectedState || { bridge_id: selectedRoom.id, participants: [] }} tab={roomTab} onTab={setRoomTab} onRefresh={() => void loadRoom(selectedRoom.id)} notify={notify} />}
@@ -415,7 +422,8 @@ function RoomPage({ room, state, tab, onTab, onRefresh, notify }: { room: Bridge
     notify("Ad-hoc participant call dispatched");
     onRefresh();
   }
-  return <div className="page-enter room-page"><div className="room-workspace"><section className="room-content"><div className="room-command-bar"><div className="room-command-identity"><span className="eyebrow">Room operations</span><h1>{room.name}</h1></div><div className="room-command-meta"><span className={`room-state-chip ${roomState.toLowerCase()}`}>{starting ? "Calling host" : running ? "Live" : "Ready"}</span><span>{connected.length} connected</span><span>{state.participants.filter((participant) => participant.role !== "HOST").length} rostered</span></div><div className="room-command-actions"><button type="button" className={`button compact-button ${running || starting ? "danger" : "primary"}`} onClick={() => void lifecycle(running || starting ? "stop" : "start")} disabled={starting}>{running || starting ? <><Ban size={14} /> Stop</> : <><Phone size={14} /> Start</>}</button><button type="button" className="button ghost compact-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh</button></div></div>{tab === "live" && <LiveControl room={room} live={live} requests={state.speaker_requests || []} onAction={performAction} onVolume={readVolume} onSpeakerAction={speakerAction} onDial={dispatchFloatingDial} defaultRegion={state.default_region || room.default_region || "+91"} />}{tab === "dialer" && <DialerPage rooms={[room]} selectedRoomId={room.id} onRoomChange={() => undefined} onOpenRoom={() => { onTab("live"); onRefresh(); }} notify={notify} embedded />}{tab === "bulk" && <BulkPage rooms={[room]} selectedRoomId={room.id} onRoomChange={() => undefined} onOpenRoom={() => { onTab("live"); onRefresh(); }} notify={notify} embedded />}{tab === "activity" && <RoomActivity participants={state.participants} sessions={state.sessions || []} onAction={performAction} />}{tab === "settings" && <RoomSettingsPanel room={room} state={state} onRefresh={onRefresh} notify={notify} />}</section></div></div>;
+  const failedChecks = (state.start_checks || []).filter((check) => !check.ok);
+  return <div className="page-enter room-page"><div className="room-workspace"><section className="room-content"><div className="room-command-bar"><div className="room-command-identity"><span className="eyebrow">Room operations</span><h1>{room.name}</h1></div><div className="room-command-meta"><span className={`room-state-chip ${roomState.toLowerCase()}`}>{starting ? "Calling host" : running ? "Live" : "Ready"}</span><span>{connected.length} connected</span><span>{state.participants.filter((participant) => participant.role !== "HOST").length} rostered</span></div><div className="room-command-actions"><button type="button" className={`button compact-button ${running || starting ? "danger" : "primary"}`} onClick={() => void lifecycle(running || starting ? "stop" : "start")} disabled={starting}>{running || starting ? <><Ban size={14} /> Stop</> : <><Phone size={14} /> Start</>}</button><button type="button" className="button ghost compact-button" onClick={onRefresh}><RefreshCw size={14} /> Refresh</button></div></div>{!running && failedChecks.length > 0 && <div className="room-start-warning"><AlertCircle size={16} /><span><strong>Room is not ready to start</strong><small>{failedChecks.map((check) => `${check.label}: ${check.detail}`).join(" · ")}</small></span><button type="button" className="text-button" onClick={() => onTab("settings")}>Open settings</button></div>}{tab === "live" && <LiveControl room={room} live={live} requests={state.speaker_requests || []} onAction={performAction} onVolume={readVolume} onSpeakerAction={speakerAction} onDial={dispatchFloatingDial} defaultRegion={state.default_region || room.default_region || "+91"} />}{tab === "dialer" && <DialerPage rooms={[room]} selectedRoomId={room.id} onRoomChange={() => undefined} onOpenRoom={() => { onTab("live"); onRefresh(); }} notify={notify} embedded />}{tab === "bulk" && <BulkPage rooms={[room]} selectedRoomId={room.id} onRoomChange={() => undefined} onOpenRoom={() => { onTab("live"); onRefresh(); }} notify={notify} embedded />}{tab === "activity" && <RoomActivity participants={state.participants} sessions={state.sessions || []} onAction={performAction} />}{tab === "settings" && <RoomSettingsPanel room={room} state={state} onRefresh={onRefresh} notify={notify} />}</section></div></div>;
 }
 
 function RoomTabButton({ active, onClick, icon: Icon, label, detail }: { active: boolean; onClick: () => void; icon: LucideIcon; label: string; detail: string }) {
@@ -429,7 +437,14 @@ function RoomActivity({ participants, sessions, onAction }: { participants: Part
   return <section className="room-activity-stack"><div className="panel session-history"><div className="panel-heading"><div><div className="eyebrow">Historical sessions</div><h2>Room call activity</h2><p className="subtle">Every start and stop is recorded with the people included in that room session.</p></div><Clock3 size={18} /></div>{sessions.length ? <div className="session-list">{sessions.map((session) => <article className="session-card" key={session.session_id}><div className="session-card-top"><div><strong>{session.status === "ENDED" ? "Completed room session" : stateLabel(session.status)}</strong><small>{shortTime(session.started_at)}{session.ended_at ? ` → ${shortTime(session.ended_at)}` : ""}</small></div><span className={`role-pill ${session.status.toLowerCase()}`}>{formatDuration(session.duration_seconds)}</span></div><div className="session-members">{session.participants?.length ? session.participants.map((member) => <span key={`${session.session_id}-${member.participant_id || member.phone_number}`}><span className="participant-avatar small">{initials(member.name || member.phone_number)}</span>{member.name || member.phone_number}<b>{member.role === "HOST" ? "Host" : "Participant"}</b></span>) : <span className="subtle">No call legs recorded.</span>}</div></article>)}</div> : <div className="session-empty"><Clock3 size={17} /><span><strong>No room sessions yet</strong><small>Start the room to create its first historical session.</small></span></div>}</div><section className="panel room-activity-panel"><div className="panel-heading"><div><div className="eyebrow">Roster history</div><h2>Participant activity</h2><p className="subtle">Review participants who have joined this room and add back a caller when needed.</p></div><label className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search participants" aria-label="Search room participant history" /></label></div>{filtered.length ? <div className="room-activity-table"><div className="room-activity-head"><span>Participant</span><span>Phone number</span><span>State</span><span>Action</span></div>{filtered.map((participant) => <div className="room-activity-row" key={`${participant.participant_id}-${participant.call_id}`}><span className="participant-identity"><span className="participant-avatar">{initials(participant.name || participant.phone_number)}</span><span><strong>{participant.name || "Unnamed participant"}</strong><small>{participant.role === "HOST" ? "Host · " : ""}{participant.phone_number}</small></span></span><span className="mono">{participant.phone_number}</span><StatusPill state={participant.state} /><span>{terminalStates.has(participant.state) ? <button type="button" className="text-button" onClick={() => void onAction(participant.participant_id, "add")}>Add back</button> : isLive(participant) ? <button type="button" className="text-button danger-text" onClick={() => void onAction(participant.participant_id, "drop")}>Drop</button> : <span className="muted-action">No action</span>}</span></div>)}</div> : <EmptyState icon={Activity} title="No participant activity" description={participants.length ? "No participants match the current search." : "This room has no participant history yet."} />}</section></section>;
 }
 
-function RoomSettingsPanel({ room, state, onRefresh, notify }: { room: Bridge; state: RoomState; onRefresh: () => void; notify: (message: string, tone?: "success" | "error") => void }) {
+type RoomSettingsProps = { room: Bridge; state: RoomState; onRefresh: () => void; notify: (message: string, tone?: "success" | "error") => void };
+
+function RoomSettingsPanel(props: RoomSettingsProps) {
+  const tfn = props.state.tfn?.number || props.room.tfn_number || "";
+  return <><section className="room-governance-card panel"><div><div className="eyebrow">Product allocation</div><h2>Room launch requirements</h2><p className="subtle">Capacity and phone identity are controlled by the PhonArch product administrator.</p></div><div className="room-governance-items"><div><span>Participant limit</span><strong>{props.state.participant_limit || props.room.participant_limit || "—"}</strong><small>callers in this room</small></div><div className={!tfn ? "missing" : ""}><span>Assigned TFN</span><strong>{tfn || "Not assigned"}</strong><small>{tfn ? props.state.tfn?.label || props.room.tfn_label || "Room caller identity" : "Admin allocation required before start"}</small></div></div></section><RoomSettingsForm {...props} /></>;
+}
+
+function RoomSettingsForm({ room, state, onRefresh, notify }: RoomSettingsProps) {
   const currentHost = state.host || { name: room.host_name || "", phone_number: room.host_phone || "" };
   const [defaultRegion, setDefaultRegion] = useState(state.default_region || room.default_region || "+91");
   const [hostName, setHostName] = useState(currentHost.name);

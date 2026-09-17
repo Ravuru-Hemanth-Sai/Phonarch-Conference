@@ -18,4 +18,5 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$MIGRATIONS/002_room_delete_constrai
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$MIGRATIONS/003_multitenant_media_ha.sql"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$MIGRATIONS/004_room_lifecycle_roster.sql"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$MIGRATIONS/005_room_dialing_region.sql"
-echo "PhonArch schema, tenancy, media HA, room lifecycle, and dialing defaults applied."
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$MIGRATIONS/006_product_admin_control.sql"
+echo "PhonArch schema, tenancy, media HA, room lifecycle, dialing defaults, and product admin controls applied."

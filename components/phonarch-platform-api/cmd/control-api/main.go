@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type node struct {
@@ -59,8 +60,12 @@ type api struct {
 }
 
 type session struct {
-	expiresAt   time.Time
-	workspaceID string
+	expiresAt     time.Time
+	workspaceID   string
+	operatorID    string
+	username      string
+	displayName   string
+	platformAdmin bool
 }
 
 var supportedDialRegions = map[string]struct{}{
@@ -123,26 +128,24 @@ func (a *api) json(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func (a *api) auth(r *http.Request) bool {
+func (a *api) currentSession(r *http.Request) (session, bool) {
 	c, err := r.Cookie("phonarch_session")
 	if err != nil {
-		return false
+		return session{}, false
 	}
 	a.mu.RLock()
 	s, ok := a.sessions[c.Value]
 	a.mu.RUnlock()
-	return ok && time.Now().Before(s.expiresAt)
+	return s, ok && time.Now().Before(s.expiresAt)
+}
+func (a *api) auth(r *http.Request) bool {
+	_, ok := a.currentSession(r)
+	return ok
 }
 
 func (a *api) workspaceID(r *http.Request) (string, bool) {
-	c, err := r.Cookie("phonarch_session")
-	if err != nil {
-		return "", false
-	}
-	a.mu.RLock()
-	s, ok := a.sessions[c.Value]
-	a.mu.RUnlock()
-	if !ok || time.Now().After(s.expiresAt) || s.workspaceID == "" {
+	s, ok := a.currentSession(r)
+	if !ok || s.workspaceID == "" {
 		return "", false
 	}
 	// The workspace is selected by the authenticated session. A future
@@ -168,16 +171,56 @@ func (a *api) require(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (a *api) requirePlatformAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.auth(r) {
+			a.json(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		s, _ := a.currentSession(r)
+		if !s.platformAdmin {
+			a.json(w, http.StatusForbidden, map[string]string{"error": "product administrator access required"})
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (a *api) login(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Username != env("ADMIN_USERNAME", "admin") || in.Password != env("ADMIN_PASSWORD", "change-me") {
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || in.Password == "" {
 		a.json(w, 401, map[string]string{"error": "invalid credentials"})
 		return
 	}
+	in.Username = strings.TrimSpace(in.Username)
 	workspaceID := a.defaultWorkspaceID
+	operatorID, displayName := "", in.Username
+	platformAdmin := false
+	bootstrapCredentials := in.Username == env("ADMIN_USERNAME", "admin") && in.Password == env("ADMIN_PASSWORD", "change-me")
+	if bootstrapCredentials {
+		var status, role string
+		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text,COALESCE(display_name,''),COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, in.Username).Scan(&operatorID, &displayName, &role, &status); err != nil || status != "ACTIVE" || (role != "PLATFORM_OWNER" && role != "PLATFORM_ADMIN") {
+			a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		platformAdmin = true
+	} else {
+		var passwordHash, role, status string
+		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text,password_hash,COALESCE(display_name,''),COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, in.Username).Scan(&operatorID, &passwordHash, &displayName, &role, &status); err != nil || status != "ACTIVE" || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+			a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		platformAdmin = role == "PLATFORM_OWNER" || role == "PLATFORM_ADMIN"
+		if workspaceID == "" || !platformAdmin {
+			if err := a.db.QueryRowContext(r.Context(), `SELECT wm.workspace_id::text FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id WHERE wm.operator_id=$1 AND w.status='ACTIVE' ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END LIMIT 1`, operatorID).Scan(&workspaceID); err != nil {
+				a.json(w, http.StatusForbidden, map[string]string{"error": "user has no workspace access"})
+				return
+			}
+		}
+	}
 	if workspaceID == "" {
 		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text FROM workspaces WHERE slug=$1`, env("DEFAULT_WORKSPACE_SLUG", "operations")).Scan(&workspaceID); err != nil {
 			a.json(w, 503, map[string]string{"error": "workspace is not initialized"})
@@ -186,10 +229,26 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 	}
 	id := newID()
 	a.mu.Lock()
-	a.sessions[id] = session{expiresAt: time.Now().Add(12 * time.Hour), workspaceID: workspaceID}
+	a.sessions[id] = session{expiresAt: time.Now().Add(12 * time.Hour), workspaceID: workspaceID, operatorID: operatorID, username: in.Username, displayName: coalesce(displayName, in.Username), platformAdmin: platformAdmin}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "phonarch_session", Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
 	a.json(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *api) me(w http.ResponseWriter, r *http.Request) {
+	s, ok := a.currentSession(r)
+	if !ok {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+	var workspace map[string]any = map[string]any{}
+	if s.workspaceID != "" {
+		var slug, name, status string
+		if a.db.QueryRowContext(r.Context(), `SELECT slug,name,status FROM workspaces WHERE id=$1`, s.workspaceID).Scan(&slug, &name, &status) == nil {
+			workspace = map[string]any{"id": s.workspaceID, "slug": slug, "name": name, "status": status}
+		}
+	}
+	a.json(w, http.StatusOK, map[string]any{"username": s.username, "display_name": s.displayName, "operator_id": s.operatorID, "platform_admin": s.platformAdmin, "workspace": workspace})
 }
 func (a *api) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("phonarch_session"); err == nil {
@@ -348,7 +407,7 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,name,status,room_state,COALESCE(host_name,''),COALESCE(host_phone,''),COALESCE(default_region,'+91'),created_at FROM bridges WHERE workspace_id=$1 ORDER BY created_at DESC`, workspaceID)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT b.id::text,b.name,b.status,b.room_state,COALESCE(b.host_name,''),COALESCE(b.host_phone,''),COALESCE(b.default_region,'+91'),b.participant_limit,COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,''),b.created_at FROM bridges b LEFT JOIN telephony_numbers t ON t.id=b.tfn_id WHERE b.workspace_id=$1 ORDER BY b.created_at DESC`, workspaceID)
 		if err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -356,10 +415,11 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var id, name, status, roomState, hostName, hostPhone, defaultRegion string
+			var id, name, status, roomState, hostName, hostPhone, defaultRegion, tfnID, tfnNumber, tfnLabel string
+			var participantLimit int
 			var created time.Time
-			_ = rows.Scan(&id, &name, &status, &roomState, &hostName, &hostPhone, &defaultRegion, &created)
-			out = append(out, map[string]any{"id": id, "name": name, "status": status, "room_state": roomState, "host_name": hostName, "host_phone": hostPhone, "default_region": normalizeDialRegion(defaultRegion), "created_at": created})
+			_ = rows.Scan(&id, &name, &status, &roomState, &hostName, &hostPhone, &defaultRegion, &participantLimit, &tfnID, &tfnNumber, &tfnLabel, &created)
+			out = append(out, map[string]any{"id": id, "name": name, "status": status, "room_state": roomState, "host_name": hostName, "host_phone": hostPhone, "default_region": normalizeDialRegion(defaultRegion), "participant_limit": participantLimit, "tfn_id": tfnID, "tfn_number": tfnNumber, "tfn_label": tfnLabel, "created_at": created})
 		}
 		a.json(w, 200, out)
 	case http.MethodPost:
@@ -371,7 +431,7 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var id string
-		err := a.db.QueryRowContext(r.Context(), `INSERT INTO bridges(workspace_id,name) VALUES($1,$2) RETURNING id::text`, workspaceID, in.Name).Scan(&id)
+		err := a.db.QueryRowContext(r.Context(), `INSERT INTO bridges(workspace_id,name,participant_limit) SELECT $1,$2,max_participants FROM workspaces WHERE id=$1 RETURNING id::text`, workspaceID, in.Name).Scan(&id)
 		if err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -492,9 +552,41 @@ func (a *api) deleteBridge(w http.ResponseWriter, r *http.Request, workspaceID, 
 	a.json(w, 200, map[string]string{"status": "deleted", "bridge_id": id})
 }
 
+func (a *api) roomStartChecks(ctx context.Context, workspaceID, bridgeID string) ([]map[string]any, bool) {
+	var hostName, hostPhone, tfnID, tfnNumber, tfnLabel, tfnStatus string
+	var participantLimit, participantCount int
+	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(b.host_name,''),COALESCE(b.host_phone,''),b.participant_limit,COUNT(p.id),COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,''),COALESCE(t.status,'') FROM bridges b LEFT JOIN participants p ON p.bridge_id=b.id AND p.workspace_id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id AND t.workspace_id=b.workspace_id WHERE b.id=$1 AND b.workspace_id=$2 GROUP BY b.id,t.id`, bridgeID, workspaceID).Scan(&hostName, &hostPhone, &participantLimit, &participantCount, &tfnID, &tfnNumber, &tfnLabel, &tfnStatus); err != nil {
+		return []map[string]any{{"key": "room", "label": "Room", "ok": false, "detail": "Room configuration could not be read"}}, false
+	}
+	hostOK := strings.TrimSpace(hostName) != "" && strings.TrimSpace(hostPhone) != ""
+	tfnOK := tfnID != "" && tfnStatus == "ACTIVE" && strings.TrimSpace(tfnNumber) != ""
+	capacityOK := participantLimit > 0 && participantCount <= participantLimit
+	checks := []map[string]any{
+		{"key": "host", "label": "Fixed host", "ok": hostOK, "detail": func() string {
+			if hostOK {
+				return hostName
+			}
+			return "Add a host in Room settings"
+		}()},
+		{"key": "tfn", "label": "Room TFN", "ok": tfnOK, "detail": func() string {
+			if tfnOK {
+				if tfnLabel != "" {
+					return tfnLabel + " · " + tfnNumber
+				}
+				return tfnNumber
+			}
+			return "Product admin must assign an active TFN"
+		}()},
+		{"key": "capacity", "label": "Participant limit", "ok": capacityOK, "detail": fmt.Sprintf("%d of %d rostered", participantCount, participantLimit)},
+	}
+	ready := hostOK && tfnOK && capacityOK
+	return checks, ready
+}
+
 func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
-	var roomState, hostName, hostPhone, defaultRegion string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,''),COALESCE(default_region,'+91') FROM bridges WHERE id=$1 AND workspace_id=$2`, id, workspaceID).Scan(&roomState, &hostName, &hostPhone, &defaultRegion); err != nil {
+	var roomState, hostName, hostPhone, defaultRegion, tfnID, tfnNumber, tfnLabel string
+	var participantLimit int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT b.room_state,COALESCE(b.host_name,''),COALESCE(b.host_phone,''),COALESCE(b.default_region,'+91'),b.participant_limit,COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,'') FROM bridges b LEFT JOIN telephony_numbers t ON t.id=b.tfn_id WHERE b.id=$1 AND b.workspace_id=$2`, id, workspaceID).Scan(&roomState, &hostName, &hostPhone, &defaultRegion, &participantLimit, &tfnID, &tfnNumber, &tfnLabel); err != nil {
 		if err == sql.ErrNoRows {
 			a.json(w, 404, map[string]string{"error": "room not found"})
 			return
@@ -542,7 +634,9 @@ func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, i
 			requests = append(requests, map[string]any{"id": requestID, "participant_id": participantID, "status": requestStatus, "digit": digit, "requested_at": requestedAt, "granted_by": grantedBy})
 		}
 	}
-	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "room_state": roomState, "default_region": normalizeDialRegion(defaultRegion), "host": map[string]string{"name": hostName, "phone_number": hostPhone}, "participants": out, "speaker_requests": requests, "sessions": a.sessionRows(r.Context(), workspaceID, id)})
+	checks, ready := a.roomStartChecks(r.Context(), workspaceID, id)
+	tfn := map[string]string{"id": tfnID, "number": tfnNumber, "label": tfnLabel}
+	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "room_state": roomState, "default_region": normalizeDialRegion(defaultRegion), "participant_limit": participantLimit, "tfn": tfn, "start_ready": ready, "start_checks": checks, "host": map[string]string{"name": hostName, "phone_number": hostPhone}, "participants": out, "speaker_requests": requests, "sessions": a.sessionRows(r.Context(), workspaceID, id)})
 }
 
 func (a *api) sessionRows(ctx context.Context, workspaceID, bridgeID string) []map[string]any {
@@ -682,6 +776,15 @@ func (a *api) addRosterParticipant(w http.ResponseWriter, r *http.Request, works
 		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before editing its participant roster"})
 		return
 	}
+	var participantLimit, participantCount int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT b.participant_limit,COUNT(p.id) FROM bridges b LEFT JOIN participants p ON p.bridge_id=b.id AND p.workspace_id=b.workspace_id WHERE b.id=$1 AND b.workspace_id=$2 GROUP BY b.id`, bridgeID, workspaceID).Scan(&participantLimit, &participantCount); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
+	}
+	if participantCount >= participantLimit {
+		a.json(w, http.StatusConflict, map[string]any{"error": "room participant limit reached", "participant_limit": participantLimit, "participant_count": participantCount})
+		return
+	}
 	var in struct {
 		Name  string `json:"name"`
 		Phone string `json:"phone_number"`
@@ -758,8 +861,9 @@ func (a *api) startRoom(w http.ResponseWriter, r *http.Request, workspaceID, bri
 		return
 	}
 	defer tx.Rollback()
-	var roomState, hostName, hostPhone string
-	if err := tx.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2 FOR UPDATE`, bridgeID, workspaceID).Scan(&roomState, &hostName, &hostPhone); err != nil {
+	var roomState, hostName, hostPhone, tfnID, tfnNumber, tfnStatus string
+	var participantLimit, participantCount int
+	if err := tx.QueryRowContext(r.Context(), `SELECT b.room_state,COALESCE(b.host_name,''),COALESCE(b.host_phone,''),b.participant_limit,COUNT(p.id),COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.status,'') FROM bridges b LEFT JOIN participants p ON p.bridge_id=b.id AND p.workspace_id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id AND t.workspace_id=b.workspace_id WHERE b.id=$1 AND b.workspace_id=$2 GROUP BY b.id,t.id`, bridgeID, workspaceID).Scan(&roomState, &hostName, &hostPhone, &participantLimit, &participantCount, &tfnID, &tfnNumber, &tfnStatus); err != nil {
 		a.json(w, 404, map[string]string{"error": "room not found"})
 		return
 	}
@@ -768,7 +872,15 @@ func (a *api) startRoom(w http.ResponseWriter, r *http.Request, workspaceID, bri
 		return
 	}
 	if strings.TrimSpace(hostName) == "" || strings.TrimSpace(hostPhone) == "" {
-		a.json(w, http.StatusConflict, map[string]string{"error": "configure a host before starting the room"})
+		a.json(w, http.StatusConflict, map[string]any{"error": "configure a host before starting the room", "code": "ROOM_START_PREREQUISITES", "checks": []map[string]any{{"key": "host", "label": "Fixed host", "ok": false, "detail": "Add a host in Room settings"}, {"key": "tfn", "label": "Room TFN", "ok": tfnID != "" && tfnStatus == "ACTIVE", "detail": "Product admin must assign an active TFN"}, {"key": "capacity", "label": "Participant limit", "ok": participantCount <= participantLimit, "detail": fmt.Sprintf("%d of %d rostered", participantCount, participantLimit)}}})
+		return
+	}
+	if tfnID == "" || tfnStatus != "ACTIVE" || strings.TrimSpace(tfnNumber) == "" {
+		a.json(w, http.StatusConflict, map[string]any{"error": "assign an active TFN to this room before starting it", "code": "ROOM_START_PREREQUISITES", "checks": []map[string]any{{"key": "host", "label": "Fixed host", "ok": true, "detail": hostName}, {"key": "tfn", "label": "Room TFN", "ok": false, "detail": "Product admin must assign an active TFN"}, {"key": "capacity", "label": "Participant limit", "ok": participantCount <= participantLimit, "detail": fmt.Sprintf("%d of %d rostered", participantCount, participantLimit)}}})
+		return
+	}
+	if participantLimit <= 0 || participantCount > participantLimit {
+		a.json(w, http.StatusConflict, map[string]any{"error": "room participant limit exceeded", "code": "ROOM_START_PREREQUISITES", "checks": []map[string]any{{"key": "host", "label": "Fixed host", "ok": true, "detail": hostName}, {"key": "tfn", "label": "Room TFN", "ok": true, "detail": tfnNumber}, {"key": "capacity", "label": "Participant limit", "ok": false, "detail": fmt.Sprintf("%d of %d rostered", participantCount, participantLimit)}}})
 		return
 	}
 	var hostID string
@@ -953,9 +1065,12 @@ func normalizeDialNumber(phone, region string) string {
 }
 
 func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, bridgeID, participantID, sessionID string) (map[string]any, error) {
-	var name, phone, role, defaultRegion string
-	if err := a.db.QueryRowContext(ctx, `SELECT p.display_name,p.phone_number,COALESCE(p.role,'LISTENER'),COALESCE(b.default_region,'+91') FROM participants p JOIN bridges b ON b.id=p.bridge_id AND b.workspace_id=p.workspace_id WHERE p.id=$1 AND p.workspace_id=$2 AND p.bridge_id=$3`, participantID, workspaceID, bridgeID).Scan(&name, &phone, &role, &defaultRegion); err != nil {
+	var name, phone, role, defaultRegion, tfnNumber, tfnStatus string
+	if err := a.db.QueryRowContext(ctx, `SELECT p.display_name,p.phone_number,COALESCE(p.role,'LISTENER'),COALESCE(b.default_region,'+91'),COALESCE(t.e164_number,''),COALESCE(t.status,'') FROM participants p JOIN bridges b ON b.id=p.bridge_id AND b.workspace_id=p.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id AND t.workspace_id=b.workspace_id WHERE p.id=$1 AND p.workspace_id=$2 AND p.bridge_id=$3`, participantID, workspaceID, bridgeID).Scan(&name, &phone, &role, &defaultRegion, &tfnNumber, &tfnStatus); err != nil {
 		return nil, err
+	}
+	if tfnStatus != "ACTIVE" || strings.TrimSpace(tfnNumber) == "" {
+		return nil, errors.New("room has no active TFN assigned")
 	}
 	dialNumber := normalizeDialNumber(phone, defaultRegion)
 	if dialNumber == "" {
@@ -976,7 +1091,7 @@ func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, brid
 		return nil, err
 	}
 	command := newID()
-	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": dialNumber, "role": role, "desired_mute": desiredMute}
+	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": dialNumber, "caller_id": tfnNumber, "role": role, "desired_mute": desiredMute}
 	if err := a.sidecar(ctx, n, "/v1/calls/originate", body); err != nil {
 		_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='FAILED',last_error=$1,ended_at=now(),updated_at=now() WHERE id=$2`, err.Error(), callID)
 		return nil, err
@@ -993,12 +1108,19 @@ func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, brid
 }
 
 func (a *api) dispatchDial(ctx context.Context, workspaceID, bridgeID, name, phone string) (map[string]any, error) {
-	var roomState string
-	if err := a.db.QueryRowContext(ctx, `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState); err != nil {
+	var roomState, tfnStatus, tfnNumber string
+	var participantLimit, participantCount int
+	if err := a.db.QueryRowContext(ctx, `SELECT b.room_state,b.participant_limit,COUNT(p.id),COALESCE(t.status,''),COALESCE(t.e164_number,'') FROM bridges b LEFT JOIN participants p ON p.bridge_id=b.id AND p.workspace_id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id AND t.workspace_id=b.workspace_id WHERE b.id=$1 AND b.workspace_id=$2 GROUP BY b.id,t.id`, bridgeID, workspaceID).Scan(&roomState, &participantLimit, &participantCount, &tfnStatus, &tfnNumber); err != nil {
 		return nil, err
 	}
 	if roomState != "RUNNING" {
 		return nil, errors.New("start the room before using the live dialer")
+	}
+	if participantCount >= participantLimit {
+		return nil, fmt.Errorf("room participant limit reached (%d)", participantLimit)
+	}
+	if tfnStatus != "ACTIVE" || strings.TrimSpace(tfnNumber) == "" {
+		return nil, errors.New("room has no active TFN assigned")
 	}
 	var participantID string
 	if err := a.db.QueryRowContext(ctx, `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'LISTENER','MUTED') RETURNING id::text`, workspaceID, bridgeID, coalesce(name, phone), phone).Scan(&participantID); err != nil {
@@ -1200,7 +1322,8 @@ func (a *api) batch(w http.ResponseWriter, r *http.Request, workspaceID, bridgeI
 		return
 	}
 	var roomState, existingHostName, existingHostPhone string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState, &existingHostName, &existingHostPhone); err != nil {
+	var participantLimit, existingParticipantCount int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT b.room_state,COALESCE(b.host_name,''),COALESCE(b.host_phone,''),b.participant_limit,COUNT(p.id) FROM bridges b LEFT JOIN participants p ON p.bridge_id=b.id AND p.workspace_id=b.workspace_id WHERE b.id=$1 AND b.workspace_id=$2 GROUP BY b.id`, bridgeID, workspaceID).Scan(&roomState, &existingHostName, &existingHostPhone, &participantLimit, &existingParticipantCount); err != nil {
 		a.json(w, 404, map[string]string{"error": "room not found"})
 		return
 	}
@@ -1224,6 +1347,10 @@ func (a *api) batch(w http.ResponseWriter, r *http.Request, workspaceID, bridgeI
 	}
 	if hostCount == 1 && existingHostPhone != "" {
 		a.json(w, http.StatusConflict, map[string]string{"error": "this room already has a host; edit the host in Room settings before importing another one"})
+		return
+	}
+	if participantLimit <= 0 || existingParticipantCount+len(in.Contacts) > participantLimit {
+		a.json(w, http.StatusConflict, map[string]any{"error": "bulk roster exceeds the room participant limit", "participant_limit": participantLimit, "existing_participants": existingParticipantCount, "requested": len(in.Contacts)})
 		return
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
@@ -1321,6 +1448,509 @@ func (a *api) batchState(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.db.ExecContext(r.Context(), `UPDATE dial_batches SET status='COMPLETED',updated_at=now() WHERE id=$1`, id)
 	}
 	a.json(w, 200, map[string]any{"batch_id": id, "status": status, "total": total, "completed": done})
+}
+
+func slugify(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+		} else if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func canonicalE164(value string) string {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, strings.TrimSpace(value))
+	if len(digits) < 7 || len(digits) > 15 || !strings.HasPrefix(strings.TrimSpace(value), "+") {
+		return ""
+	}
+	return "+" + digits
+}
+
+func (a *api) admin(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin"), "/")
+	parts := strings.Split(path, "/")
+	if path == "overview" && r.Method == http.MethodGet {
+		a.adminOverview(w, r)
+		return
+	}
+	if path == "users" {
+		if r.Method == http.MethodGet {
+			a.adminUsers(w, r)
+			return
+		}
+		if r.Method == http.MethodPost {
+			a.adminCreateUser(w, r)
+			return
+		}
+	}
+	if len(parts) >= 1 && parts[0] == "users" && len(parts) == 2 && r.Method == http.MethodPut {
+		a.adminUpdateUser(w, r, parts[1])
+		return
+	}
+	if path == "workspaces" {
+		if r.Method == http.MethodGet {
+			a.adminWorkspaces(w, r)
+			return
+		}
+		if r.Method == http.MethodPost {
+			a.adminCreateWorkspace(w, r)
+			return
+		}
+	}
+	if len(parts) >= 2 && parts[0] == "workspaces" {
+		workspaceID := parts[1]
+		if len(parts) == 2 && r.Method == http.MethodPut {
+			a.adminUpdateWorkspace(w, r, workspaceID)
+			return
+		}
+		if len(parts) == 3 && parts[2] == "members" {
+			if r.Method == http.MethodGet {
+				a.adminMembers(w, r, workspaceID)
+				return
+			}
+			if r.Method == http.MethodPost {
+				a.adminAddMember(w, r, workspaceID)
+				return
+			}
+		}
+		if len(parts) == 4 && parts[2] == "members" && r.Method == http.MethodDelete {
+			a.adminRemoveMember(w, r, workspaceID, parts[3])
+			return
+		}
+	}
+	if path == "rooms" && r.Method == http.MethodGet {
+		a.adminRooms(w, r)
+		return
+	}
+	if path == "rooms" && r.Method == http.MethodPost {
+		a.adminCreateRoom(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[0] == "rooms" && r.Method == http.MethodPut {
+		a.adminUpdateRoom(w, r, parts[1])
+		return
+	}
+	if path == "tfns" && r.Method == http.MethodGet {
+		a.adminTFNs(w, r)
+		return
+	}
+	if path == "tfns" && r.Method == http.MethodPost {
+		a.adminCreateTFN(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[0] == "tfns" && r.Method == http.MethodDelete {
+		a.adminDeleteTFN(w, r, parts[1])
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func (a *api) adminOverview(w http.ResponseWriter, r *http.Request) {
+	var workspaces, rooms, users, tfns int
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspaces WHERE status='ACTIVE'`).Scan(&workspaces)
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM bridges WHERE status='ACTIVE'`).Scan(&rooms)
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM operators WHERE status='ACTIVE'`).Scan(&users)
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM telephony_numbers WHERE status='ACTIVE'`).Scan(&tfns)
+	a.json(w, http.StatusOK, map[string]any{"workspaces": workspaces, "rooms": rooms, "users": users, "tfns": tfns})
+}
+
+func (a *api) adminWorkspaces(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT w.id::text,w.slug,w.name,w.status,w.max_participants,COUNT(DISTINCT b.id),COUNT(DISTINCT t.id) FROM workspaces w LEFT JOIN bridges b ON b.workspace_id=w.id LEFT JOIN telephony_numbers t ON t.workspace_id=w.id GROUP BY w.id ORDER BY w.created_at DESC`)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, slug, name, status string
+		var maxParticipants, roomCount, tfnCount int
+		if rows.Scan(&id, &slug, &name, &status, &maxParticipants, &roomCount, &tfnCount) == nil {
+			out = append(out, map[string]any{"id": id, "slug": slug, "name": name, "status": status, "max_participants": maxParticipants, "room_count": roomCount, "tfn_count": tfnCount})
+		}
+	}
+	a.json(w, http.StatusOK, out)
+}
+
+func (a *api) adminCreateWorkspace(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name            string `json:"name"`
+		Slug            string `json:"slug"`
+		MaxParticipants int    `json:"max_participants"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" {
+		a.json(w, 400, map[string]string{"error": "workspace name required"})
+		return
+	}
+	if in.MaxParticipants <= 0 {
+		in.MaxParticipants = 500
+	}
+	if in.MaxParticipants > 100000 {
+		a.json(w, 400, map[string]string{"error": "max_participants must be between 1 and 100000"})
+		return
+	}
+	slug := slugify(in.Slug)
+	if slug == "" {
+		slug = slugify(in.Name)
+	}
+	var id string
+	err := a.db.QueryRowContext(r.Context(), `INSERT INTO workspaces(slug,name,max_participants) VALUES($1,$2,$3) RETURNING id::text`, slug, strings.TrimSpace(in.Name), in.MaxParticipants).Scan(&id)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "workspace slug already exists or limit is invalid"})
+		return
+	}
+	a.json(w, http.StatusCreated, map[string]any{"id": id, "slug": slug, "name": strings.TrimSpace(in.Name), "max_participants": in.MaxParticipants, "status": "ACTIVE"})
+}
+
+func (a *api) adminUpdateWorkspace(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	var in struct {
+		Name            string `json:"name"`
+		Status          string `json:"status"`
+		MaxParticipants int    `json:"max_participants"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || in.MaxParticipants <= 0 {
+		a.json(w, 400, map[string]string{"error": "name and positive max_participants required"})
+		return
+	}
+	if in.Status != "SUSPENDED" {
+		in.Status = "ACTIVE"
+	}
+	result, err := a.db.ExecContext(r.Context(), `UPDATE workspaces SET name=$1,status=$2,max_participants=$3,updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.Status, in.MaxParticipants, workspaceID)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		a.json(w, 404, map[string]string{"error": "workspace not found"})
+		return
+	}
+	a.json(w, 200, map[string]any{"status": "saved", "workspace_id": workspaceID})
+}
+
+func (a *api) adminRooms(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT b.id::text,b.workspace_id::text,w.name,b.name,b.status,b.room_state,b.participant_limit,COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,'') FROM bridges b JOIN workspaces w ON w.id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id ORDER BY b.created_at DESC`)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, workspaceID, workspaceName, name, status, roomState, tfnID, tfnNumber, tfnLabel string
+		var limit int
+		if rows.Scan(&id, &workspaceID, &workspaceName, &name, &status, &roomState, &limit, &tfnID, &tfnNumber, &tfnLabel) == nil {
+			out = append(out, map[string]any{"id": id, "workspace_id": workspaceID, "workspace_name": workspaceName, "name": name, "status": status, "room_state": roomState, "participant_limit": limit, "tfn_id": tfnID, "tfn_number": tfnNumber, "tfn_label": tfnLabel})
+		}
+	}
+	a.json(w, http.StatusOK, out)
+}
+
+func (a *api) adminCreateRoom(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		WorkspaceID      string `json:"workspace_id"`
+		Name             string `json:"name"`
+		ParticipantLimit int    `json:"participant_limit"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.WorkspaceID) == "" || strings.TrimSpace(in.Name) == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id and room name required"})
+		return
+	}
+	if in.ParticipantLimit <= 0 {
+		_ = a.db.QueryRowContext(r.Context(), `SELECT max_participants FROM workspaces WHERE id=$1`, in.WorkspaceID).Scan(&in.ParticipantLimit)
+	}
+	if in.ParticipantLimit <= 0 || in.ParticipantLimit > 100000 {
+		a.json(w, 400, map[string]string{"error": "participant_limit must be between 1 and 100000"})
+		return
+	}
+	var id string
+	err := a.db.QueryRowContext(r.Context(), `INSERT INTO bridges(workspace_id,name,participant_limit) VALUES($1,$2,$3) RETURNING id::text`, in.WorkspaceID, strings.TrimSpace(in.Name), in.ParticipantLimit).Scan(&id)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "room could not be created; check workspace, name, and participant limit"})
+		return
+	}
+	a.json(w, http.StatusCreated, map[string]any{"id": id, "workspace_id": in.WorkspaceID, "name": strings.TrimSpace(in.Name), "participant_limit": in.ParticipantLimit, "room_state": "READY"})
+}
+
+func (a *api) adminUpdateRoom(w http.ResponseWriter, r *http.Request, roomID string) {
+	var in struct {
+		Name             string  `json:"name"`
+		ParticipantLimit int     `json:"participant_limit"`
+		TFNID            *string `json:"tfn_id"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || in.ParticipantLimit <= 0 {
+		a.json(w, 400, map[string]string{"error": "name and positive participant_limit required"})
+		return
+	}
+	var workspaceID, roomState string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT workspace_id::text,room_state FROM bridges WHERE id=$1`, roomID).Scan(&workspaceID, &roomState); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before changing its limit or TFN"})
+		return
+	}
+	var currentCount int
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM participants WHERE bridge_id=$1`, roomID).Scan(&currentCount)
+	if in.ParticipantLimit < currentCount {
+		a.json(w, http.StatusConflict, map[string]string{"error": "participant_limit cannot be below the current roster count"})
+		return
+	}
+	tfnID := ""
+	if in.TFNID != nil {
+		tfnID = strings.TrimSpace(*in.TFNID)
+		if tfnID != "" {
+			var tfnWorkspace, tfnStatus string
+			if err := a.db.QueryRowContext(r.Context(), `SELECT workspace_id::text,status FROM telephony_numbers WHERE id=$1`, tfnID).Scan(&tfnWorkspace, &tfnStatus); err != nil || tfnWorkspace != workspaceID || tfnStatus != "ACTIVE" {
+				a.json(w, http.StatusConflict, map[string]string{"error": "TFN is not active or does not belong to this workspace"})
+				return
+			}
+		}
+	}
+	_, err := a.db.ExecContext(r.Context(), `UPDATE bridges SET name=$1,participant_limit=$2,tfn_id=NULLIF($3,''),updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.ParticipantLimit, tfnID, roomID)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "room update failed; TFN may already be assigned to another room"})
+		return
+	}
+	a.json(w, 200, map[string]any{"status": "saved", "room_id": roomID})
+}
+
+func (a *api) adminTFNs(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT t.id::text,t.workspace_id::text,w.name,t.e164_number,t.label,t.provider_ref,t.status,COALESCE(b.id::text,''),COALESCE(b.name,'') FROM telephony_numbers t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN bridges b ON b.tfn_id=t.id ORDER BY t.created_at DESC`)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, workspaceID, workspaceName, number, label, providerRef, status, roomID, roomName string
+		if rows.Scan(&id, &workspaceID, &workspaceName, &number, &label, &providerRef, &status, &roomID, &roomName) == nil {
+			out = append(out, map[string]any{"id": id, "workspace_id": workspaceID, "workspace_name": workspaceName, "number": number, "label": label, "provider_ref": providerRef, "status": status, "room_id": roomID, "room_name": roomName})
+		}
+	}
+	a.json(w, http.StatusOK, out)
+}
+
+func (a *api) adminCreateTFN(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		WorkspaceID string `json:"workspace_id"`
+		Number      string `json:"number"`
+		Label       string `json:"label"`
+		ProviderRef string `json:"provider_ref"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.WorkspaceID) == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id required"})
+		return
+	}
+	number := canonicalE164(in.Number)
+	if number == "" {
+		a.json(w, 400, map[string]string{"error": "number must be an E.164 value such as +919876543210"})
+		return
+	}
+	var id string
+	err := a.db.QueryRowContext(r.Context(), `INSERT INTO telephony_numbers(workspace_id,e164_number,label,provider_ref) VALUES($1,$2,$3,$4) RETURNING id::text`, in.WorkspaceID, number, strings.TrimSpace(in.Label), strings.TrimSpace(in.ProviderRef)).Scan(&id)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "TFN already exists or workspace is invalid"})
+		return
+	}
+	a.json(w, http.StatusCreated, map[string]any{"id": id, "workspace_id": in.WorkspaceID, "number": number, "label": in.Label, "status": "ACTIVE"})
+}
+
+func (a *api) adminDeleteTFN(w http.ResponseWriter, r *http.Request, tfnID string) {
+	result, err := a.db.ExecContext(r.Context(), `DELETE FROM telephony_numbers WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM bridges WHERE tfn_id=$1)`, tfnID)
+	if err != nil {
+		a.json(w, 409, map[string]string{"error": "TFN could not be removed"})
+		return
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		a.json(w, http.StatusConflict, map[string]string{"error": "TFN is assigned to a room or does not exist"})
+		return
+	}
+	a.json(w, 200, map[string]string{"status": "deleted"})
+}
+
+func (a *api) adminMembers(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY o.username`, workspaceID)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, username, displayName, platformRole, status, role string
+		if rows.Scan(&id, &username, &displayName, &platformRole, &status, &role) == nil {
+			out = append(out, map[string]any{"operator_id": id, "username": username, "display_name": displayName, "platform_role": platformRole, "status": status, "role": role})
+		}
+	}
+	a.json(w, 200, out)
+}
+
+func (a *api) adminAddMember(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	var in struct {
+		OperatorID string `json:"operator_id"`
+		Role       string `json:"role"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.OperatorID) == "" {
+		a.json(w, 400, map[string]string{"error": "operator_id required"})
+		return
+	}
+	if in.Role != "OWNER" && in.Role != "ADMIN" && in.Role != "VIEWER" {
+		in.Role = "OPERATOR"
+	}
+	_, err := a.db.ExecContext(r.Context(), `INSERT INTO workspace_members(workspace_id,operator_id,role) VALUES($1,$2,$3) ON CONFLICT(workspace_id,operator_id) DO UPDATE SET role=EXCLUDED.role`, workspaceID, in.OperatorID, in.Role)
+	if err != nil {
+		a.json(w, 409, map[string]string{"error": "workspace member could not be saved"})
+		return
+	}
+	a.json(w, 200, map[string]string{"status": "saved"})
+}
+
+func (a *api) adminRemoveMember(w http.ResponseWriter, r *http.Request, workspaceID, operatorID string) {
+	result, err := a.db.ExecContext(r.Context(), `DELETE FROM workspace_members WHERE workspace_id=$1 AND operator_id=$2 AND role <> 'OWNER'`, workspaceID, operatorID)
+	if err != nil {
+		a.json(w, 409, map[string]string{"error": "member could not be removed"})
+		return
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		a.json(w, 409, map[string]string{"error": "owner membership cannot be removed"})
+		return
+	}
+	a.json(w, 200, map[string]string{"status": "removed"})
+}
+
+func (a *api) adminUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,username,COALESCE(display_name,''),platform_role,status,created_at FROM operators ORDER BY created_at DESC`)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, username, displayName, platformRole, status string
+		var createdAt time.Time
+		if rows.Scan(&id, &username, &displayName, &platformRole, &status, &createdAt) == nil {
+			out = append(out, map[string]any{"id": id, "username": username, "display_name": displayName, "platform_role": platformRole, "status": status, "created_at": createdAt})
+		}
+	}
+	a.json(w, 200, out)
+}
+
+func (a *api) adminCreateUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username      string `json:"username"`
+		DisplayName   string `json:"display_name"`
+		Password      string `json:"password"`
+		PlatformRole  string `json:"platform_role"`
+		WorkspaceID   string `json:"workspace_id"`
+		WorkspaceRole string `json:"workspace_role"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || len(in.Password) < 8 {
+		a.json(w, 400, map[string]string{"error": "username and a password of at least 8 characters are required"})
+		return
+	}
+	if in.PlatformRole != "PLATFORM_ADMIN" {
+		in.PlatformRole = "WORKSPACE_OPERATOR"
+	}
+	if in.WorkspaceRole != "OWNER" && in.WorkspaceRole != "ADMIN" && in.WorkspaceRole != "VIEWER" {
+		in.WorkspaceRole = "OPERATOR"
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	var id string
+	err = a.db.QueryRowContext(r.Context(), `INSERT INTO operators(username,password_hash,display_name,platform_role,status) VALUES($1,$2,$3,$4,'ACTIVE') RETURNING id::text`, strings.TrimSpace(in.Username), string(hash), strings.TrimSpace(in.DisplayName), in.PlatformRole).Scan(&id)
+	if err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "username already exists"})
+		return
+	}
+	if in.WorkspaceID != "" {
+		if _, err = a.db.ExecContext(r.Context(), `INSERT INTO workspace_members(workspace_id,operator_id,role) VALUES($1,$2,$3)`, in.WorkspaceID, id, in.WorkspaceRole); err != nil {
+			_, _ = a.db.ExecContext(r.Context(), `DELETE FROM operators WHERE id=$1`, id)
+			a.json(w, http.StatusConflict, map[string]string{"error": "user created but workspace membership was invalid"})
+			return
+		}
+	}
+	a.json(w, http.StatusCreated, map[string]any{"id": id, "username": in.Username, "display_name": in.DisplayName, "platform_role": in.PlatformRole, "status": "ACTIVE"})
+}
+
+func (a *api) adminUpdateUser(w http.ResponseWriter, r *http.Request, operatorID string) {
+	var in struct {
+		DisplayName  string `json:"display_name"`
+		Status       string `json:"status"`
+		PlatformRole string `json:"platform_role"`
+		Password     string `json:"password"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		a.json(w, 400, map[string]string{"error": "invalid user payload"})
+		return
+	}
+	if in.Status != "DISABLED" {
+		in.Status = "ACTIVE"
+	}
+	if in.PlatformRole != "PLATFORM_ADMIN" && in.PlatformRole != "PLATFORM_OWNER" {
+		in.PlatformRole = "WORKSPACE_OPERATOR"
+	}
+	var existingRole, existingStatus string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT platform_role,status FROM operators WHERE id=$1`, operatorID).Scan(&existingRole, &existingStatus); err != nil {
+		a.json(w, 404, map[string]string{"error": "user not found"})
+		return
+	}
+	current, currentOK := a.currentSession(r)
+	if currentOK && current.operatorID == operatorID && (in.Status != "ACTIVE" || (in.PlatformRole != "PLATFORM_ADMIN" && in.PlatformRole != "PLATFORM_OWNER")) {
+		a.json(w, http.StatusConflict, map[string]string{"error": "you cannot remove your own product administrator access"})
+		return
+	}
+	existingAdmin := existingRole == "PLATFORM_OWNER" || existingRole == "PLATFORM_ADMIN"
+	remainingAdmin := in.PlatformRole == "PLATFORM_OWNER" || in.PlatformRole == "PLATFORM_ADMIN"
+	if existingAdmin && (!remainingAdmin || in.Status != "ACTIVE") {
+		var activeAdmins int
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM operators WHERE status='ACTIVE' AND platform_role IN ('PLATFORM_OWNER','PLATFORM_ADMIN')`).Scan(&activeAdmins)
+		if activeAdmins <= 1 {
+			a.json(w, http.StatusConflict, map[string]string{"error": "at least one active product administrator must remain"})
+			return
+		}
+	}
+	if strings.TrimSpace(in.Password) != "" {
+		if len(in.Password) < 8 {
+			a.json(w, 400, map[string]string{"error": "password must be at least 8 characters"})
+			return
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+		if err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		_, err = a.db.ExecContext(r.Context(), `UPDATE operators SET display_name=$1,status=$2,platform_role=$3,password_hash=$4 WHERE id=$5`, strings.TrimSpace(in.DisplayName), in.Status, in.PlatformRole, string(hash), operatorID)
+		if err != nil {
+			a.json(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+	} else if _, err := a.db.ExecContext(r.Context(), `UPDATE operators SET display_name=$1,status=$2,platform_role=$3 WHERE id=$4`, strings.TrimSpace(in.DisplayName), in.Status, in.PlatformRole, operatorID); err != nil {
+		a.json(w, 409, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 200, map[string]string{"status": "saved"})
 }
 
 func (a *api) internalAllowed(r *http.Request) bool {
@@ -1533,6 +2163,21 @@ func (a *api) finishHostSession(ctx context.Context, callID, state string) {
 	_, _ = a.db.ExecContext(ctx, `UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND room_state IN ('STARTING','RUNNING')`, bridgeID, workspaceID)
 }
 
+func ensureBootstrapAdmin(db *sql.DB) error {
+	username := env("ADMIN_USERNAME", "admin")
+	password := env("ADMIN_PASSWORD", "change-me")
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO operators(username,password_hash,display_name,platform_role,status) VALUES($1,$2,$3,'PLATFORM_OWNER','ACTIVE') ON CONFLICT(username) DO UPDATE SET display_name=EXCLUDED.display_name,platform_role='PLATFORM_OWNER',status='ACTIVE',password_hash=EXCLUDED.password_hash`, username, string(hash), username)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO workspace_members(workspace_id,operator_id,role) SELECT id,(SELECT id FROM operators WHERE username=$1),'OWNER' FROM workspaces WHERE slug=$2 ON CONFLICT(workspace_id,operator_id) DO UPDATE SET role='OWNER'`, username, env("DEFAULT_WORKSPACE_SLUG", "operations"))
+	return err
+}
+
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -1545,6 +2190,10 @@ func main() {
 	}
 	if err = db.Ping(); err != nil {
 		slog.Error("postgres unavailable", "error", err)
+		os.Exit(1)
+	}
+	if err := ensureBootstrapAdmin(db); err != nil {
+		slog.Error("bootstrap product admin unavailable", "error", err)
 		os.Exit(1)
 	}
 	workspaceID := strings.TrimSpace(env("DEFAULT_WORKSPACE_ID", ""))
@@ -1567,12 +2216,14 @@ func main() {
 	})
 	mux.HandleFunc("/api/v1/auth/login", a.login)
 	mux.HandleFunc("/api/v1/auth/logout", a.require(a.logout))
+	mux.HandleFunc("/api/v1/auth/me", a.require(a.me))
 	mux.HandleFunc("/api/v1/workspace", a.require(a.workspace))
 	mux.HandleFunc("/api/v1/bridges", a.require(a.bridges))
 	mux.HandleFunc("/api/v1/bridges/", a.require(a.bridge))
 	mux.HandleFunc("/api/v1/participants/", a.require(a.action))
 	mux.HandleFunc("/api/v1/batches/", a.require(a.batchState))
 	mux.HandleFunc("/api/v1/speaker-requests/", a.require(a.speakerRequestAction))
+	mux.HandleFunc("/api/v1/admin/", a.requirePlatformAdmin(a.admin))
 	mux.HandleFunc("/internal/v1/events", a.events)
 	mux.HandleFunc("/internal/v1/dtmf", a.dtmf)
 	addr := env("CONTROL_API_LISTEN", "127.0.0.1:8081")
