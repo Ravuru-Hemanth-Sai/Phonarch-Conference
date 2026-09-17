@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
@@ -473,19 +473,28 @@ function LiveControl({ room, live, requests, onAction, onVolume, onSpeakerAction
 }
 
 function FloatingDialer({ onDial, defaultRegion }: { onDial: (name: string, phone: string) => Promise<void>; defaultRegion: string }) {
+  const dialerRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [region, setRegion] = useState(defaultRegion);
   const [busy, setBusy] = useState(false);
   const normalizedPhone = normalizePhone(phone, region);
+  useEffect(() => {
+    if (!open) return;
+    function closeOnOutsidePointer(event: PointerEvent) {
+      if (dialerRef.current && !dialerRef.current.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [open]);
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!normalizedPhone) return;
     setBusy(true);
     try { await onDial(name.trim() || normalizedPhone, normalizedPhone); setName(""); setPhone(""); setOpen(false); } catch { /* parent toast owns the error */ } finally { setBusy(false); }
   }
-  return <div className="live-dialer"><button type="button" className="live-dialer-fab" title="Dial an ad-hoc participant" aria-label="Dial an ad-hoc participant" onClick={() => setOpen((value) => !value)}><Phone size={19} /><span>Dial</span></button>{open && <form className="live-dialer-popover panel" onSubmit={(event) => void submit(event)}><div className="eyebrow">Live room dialer</div><h3>Add a caller</h3><p className="subtle">This call is attached to the current room only.</p><input className="field-control" value={name} onChange={(event) => setName(event.target.value)} placeholder="Name" /><label className="field-label">Dialing region<select className="field-control" value={region} onChange={(event) => setRegion(event.target.value)}>{dialRegions.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}</select></label><input className="field-control" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="Phone number" inputMode="tel" required />{normalizedPhone && <span className="dial-region-preview">Will dial {normalizedPhone}</span>}<button className="button primary" disabled={busy || !normalizedPhone}><Phone size={14} /> {busy ? "Calling…" : "Dial participant"}</button></form>}</div>;
+  return <div ref={dialerRef} className="live-dialer"><button type="button" className="live-dialer-fab" title="Dial an ad-hoc participant" aria-label="Dial an ad-hoc participant" onClick={() => setOpen((value) => !value)}><Phone size={19} /><span>Dial</span></button>{open && <form className="live-dialer-popover panel" onSubmit={(event) => void submit(event)}><div className="eyebrow">Live room dialer</div><h3>Add a caller</h3><p className="subtle">This call is attached to the current room only.</p><input className="field-control" value={name} onChange={(event) => setName(event.target.value)} placeholder="Name" /><label className="field-label">Dialing region<select className="field-control" value={region} onChange={(event) => setRegion(event.target.value)}>{dialRegions.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}</select></label><input className="field-control" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="Phone number" inputMode="tel" required />{normalizedPhone && <span className="dial-region-preview">Will dial {normalizedPhone}</span>}<button className="button primary" disabled={busy || !normalizedPhone}><Phone size={14} /> {busy ? "Calling…" : "Dial participant"}</button></form>}</div>;
 }
 
 function ParticipantRow({ participant, onAction, onVolume }: { participant: Participant; onAction: (participantId: string, action: "mute" | "unmute" | "drop" | "add") => Promise<void>; onVolume: (participantId: string) => Promise<void> }) {
