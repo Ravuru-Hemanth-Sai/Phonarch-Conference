@@ -64,10 +64,10 @@ workspace scope, not a second product UI. A product administrator can switch
 between active workspaces, create customer accounts, assign TFNs, and control
 room limits. There is deliberately no public signup route.
 
-The product admin console manages the platform-wide inventory and policy that a
-customer operator must not control:
+The product admin console manages the platform-wide inventory and workspace
+membership that a customer operator must not control:
 
-- workspaces and their maximum participant policy;
+- workspace lifecycle and status;
 - a selected-workspace scope for rooms, users, members, and TFNs;
 - workspace membership and roles (`OWNER`, `ADMIN`, `OPERATOR`, `VIEWER`);
 - rooms in the selected workspace and each room's participant limit;
@@ -75,10 +75,12 @@ customer operator must not control:
 - the one-room assignment of an active TFN; and
 - platform users and their platform role.
 
-TFNs are not global caller-ID values. A TFN belongs to one workspace and may be
-assigned to one room in that workspace. The room settings page displays the
-assigned TFN and the room start gate requires all of the following: a fixed host,
-an active TFN assigned by product administration, and a roster within the room
+TFNs and concurrency limits are room-scoped resources, not landing-page or
+workspace-wide controls. A TFN belongs to one workspace and may be assigned to
+one room in that workspace. The room Settings page is the only place where the
+assigned TFN and room participant limit are shown; product administrators can
+edit them there, while workspace users can only view them. The room start gate
+requires a fixed host, an active room TFN, and a roster within that room's
 participant limit. A failed prerequisite is returned as a structured `409`
 response and shown as an actionable warning in the room UI. The selected TFN is
 also passed as caller ID to the sidecar originate command.
@@ -396,8 +398,8 @@ The API binds to localhost by default. If it is exposed beyond the host, configu
 The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icons. It contains:
 
 - workspace landing page with room cards and room deletion confirmation;
-- separate `/admin/login` product identity boundary with the shared workspace/room UI at `/admin`; the product-admin session adds cross-workspace selection and editable TFN/concurrency policy;
-- workspace Settings user management for OWNER/ADMIN roles, scoped to the current workspace;
+- separate `/admin/login` product identity boundary with the shared workspace/room UI at `/admin`; the product-admin session adds cross-workspace selection, workspace creation from the switcher, and room-only TFN/concurrency policy controls inside Room Settings;
+- workspace Settings user management for OWNER/ADMIN roles, scoped to the current workspace and excluding platform-admin identities;
 - fixed host editor and editable participant roster;
 - direct SIP dialer plus live floating ad-hoc dialer;
 - room-scoped dialing region selection with `+91` as the default and live number normalization;

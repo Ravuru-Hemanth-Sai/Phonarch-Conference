@@ -373,7 +373,7 @@ func (a *api) workspaceMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END,o.username`, workspaceID)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 AND o.platform_role NOT IN ('PLATFORM_OWNER','PLATFORM_ADMIN') ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END,o.username`, workspaceID)
 		if err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -1796,7 +1796,7 @@ func (a *api) adminOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspaces WHERE id=$1 AND status='ACTIVE'`, workspaceID).Scan(&workspaces)
 		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM bridges WHERE workspace_id=$1 AND status='ACTIVE'`, workspaceID).Scan(&rooms)
-		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspace_members WHERE workspace_id=$1`, workspaceID).Scan(&users)
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 AND o.platform_role NOT IN ('PLATFORM_OWNER','PLATFORM_ADMIN')`, workspaceID).Scan(&users)
 		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM telephony_numbers WHERE workspace_id=$1 AND status='ACTIVE'`, workspaceID).Scan(&tfns)
 		a.json(w, http.StatusOK, map[string]any{"workspace_id": workspaceID, "workspaces": workspaces, "rooms": rooms, "users": users, "tfns": tfns})
 		return
@@ -1860,16 +1860,27 @@ func (a *api) adminUpdateWorkspace(w http.ResponseWriter, r *http.Request, works
 	var in struct {
 		Name            string `json:"name"`
 		Status          string `json:"status"`
-		MaxParticipants int    `json:"max_participants"`
+		MaxParticipants *int   `json:"max_participants"`
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || in.MaxParticipants <= 0 {
-		a.json(w, 400, map[string]string{"error": "name and positive max_participants required"})
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" {
+		a.json(w, 400, map[string]string{"error": "workspace name required"})
 		return
 	}
 	if in.Status != "SUSPENDED" {
 		in.Status = "ACTIVE"
 	}
-	result, err := a.db.ExecContext(r.Context(), `UPDATE workspaces SET name=$1,status=$2,max_participants=$3,updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.Status, in.MaxParticipants, workspaceID)
+	maxParticipants := 500
+	if in.MaxParticipants != nil {
+		maxParticipants = *in.MaxParticipants
+		if maxParticipants <= 0 || maxParticipants > 100000 {
+			a.json(w, 400, map[string]string{"error": "max_participants must be between 1 and 100000"})
+			return
+		}
+	} else if err := a.db.QueryRowContext(r.Context(), `SELECT max_participants FROM workspaces WHERE id=$1`, workspaceID).Scan(&maxParticipants); err != nil {
+		a.json(w, 404, map[string]string{"error": "workspace not found"})
+		return
+	}
+	result, err := a.db.ExecContext(r.Context(), `UPDATE workspaces SET name=$1,status=$2,max_participants=$3,updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.Status, maxParticipants, workspaceID)
 	if err != nil {
 		a.json(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
@@ -2049,7 +2060,7 @@ func (a *api) adminDeleteTFN(w http.ResponseWriter, r *http.Request, tfnID strin
 }
 
 func (a *api) adminMembers(w http.ResponseWriter, r *http.Request, workspaceID string) {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY o.username`, workspaceID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 AND o.platform_role NOT IN ('PLATFORM_OWNER','PLATFORM_ADMIN') ORDER BY o.username`, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -2105,7 +2116,7 @@ func (a *api) adminUsers(w http.ResponseWriter, r *http.Request) {
 		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,o.created_at FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY o.created_at DESC`, workspaceID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,o.created_at FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 AND o.platform_role NOT IN ('PLATFORM_OWNER','PLATFORM_ADMIN') ORDER BY o.created_at DESC`, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
