@@ -6,10 +6,14 @@ RUNTIME="$DATA_ROOT/state/runtime"
 COMPONENTS_ROOT="$DATA_ROOT/components"
 ENV_FILE="${PHONARCH_ENV_FILE:-$DATA_ROOT/state/secrets/phonarch-conference.env}"
 [[ -f "$ENV_FILE" ]] && set -a && source "$ENV_FILE" && set +a
-for tool_dir in "$DATA_ROOT/toolchain/node/bin" "$DATA_ROOT/toolchain/go/bin" "$DATA_ROOT/toolchains/redis/usr/bin"; do
+for tool_dir in "$DATA_ROOT/toolchain/node/bin" "$DATA_ROOT/toolchain/go/bin" "$DATA_ROOT/toolchains/redis/usr/bin" "$DATA_ROOT/toolchains/postgres/usr/bin"; do
   [[ -d "$tool_dir" ]] && PATH="$tool_dir:$PATH"
 done
 export PATH
+
+if [[ -d "$DATA_ROOT/toolchains/postgres/usr/lib64" ]]; then
+  export LD_LIBRARY_PATH="$DATA_ROOT/toolchains/postgres/usr/lib64:$DATA_ROOT/toolchains/postgres/usr/lib:${LD_LIBRARY_PATH:-}"
+fi
 
 case "${PHONARCH_BIN_SUFFIX:-$(uname -m)}" in
   x86_64|amd64) BIN_SUFFIX="linux-amd64" ;;
@@ -54,6 +58,22 @@ fi
 [[ "$redis_ready" -eq 1 ]] || { echo "Redis did not become ready" >&2; exit 1; }
 
 export REDIS_ADDR="${REDIS_ADDR:-${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}}"
+
+# PostgreSQL is normally a separately managed host service. The local lab also
+# keeps a native cluster under /data so the complete test stack can be started
+# without relying on a systemd unit or a container.
+if [[ -d "${PHONARCH_POSTGRES_DATA:-$RUNTIME/postgres}" ]] && command -v postgres >/dev/null 2>&1 && command -v pg_isready >/dev/null 2>&1; then
+  pg_host="${PHONARCH_POSTGRES_HOST:-127.0.0.1}"
+  pg_port="${PHONARCH_POSTGRES_PORT:-5432}"
+  pg_data="${PHONARCH_POSTGRES_DATA:-$RUNTIME/postgres}"
+  if ! pg_isready -h "$pg_host" -p "$pg_port" >/dev/null 2>&1; then
+    start_bg postgres env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" postgres -D "$pg_data" -h "$pg_host" -p "$pg_port" -k "$RUNTIME/postgres"
+    for _ in {1..30}; do
+      pg_isready -h "$pg_host" -p "$pg_port" >/dev/null 2>&1 && break
+      sleep 0.25
+    done
+  fi
+fi
 
 # The number of edge processes is the number of configured bind addresses.
 # IDs are derived from private addresses unless the deployment supplies IDs.

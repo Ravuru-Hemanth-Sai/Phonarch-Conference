@@ -47,7 +47,8 @@ func update(id string, fn func(*call)) {
 
 func originate(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		CallID string `json:"call_id"`
+		CallID      string `json:"call_id"`
+		DesiredMute bool   `json:"desired_mute"`
 	}
 	if json.NewDecoder(r.Body).Decode(&input) != nil || input.CallID == "" {
 		http.Error(w, "call_id required", http.StatusBadRequest)
@@ -55,7 +56,7 @@ func originate(w http.ResponseWriter, r *http.Request) {
 	}
 	member := fmt.Sprintf("mock-member-%d", seq.Add(1))
 	mu.Lock()
-	calls[input.CallID] = call{CallID: input.CallID, PBXMemberID: member, State: "DISPATCHED", VolumeDB: -18}
+	calls[input.CallID] = call{CallID: input.CallID, PBXMemberID: member, State: "DISPATCHED", Muted: input.DesiredMute, VolumeDB: -18}
 	mu.Unlock()
 	go func() {
 		for _, state := range []string{"RINGING", "ANSWERED", "IN_BRIDGE"} {

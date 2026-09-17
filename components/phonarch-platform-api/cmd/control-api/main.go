@@ -40,6 +40,7 @@ type node struct {
 type batchContact struct {
 	Name  string `json:"name"`
 	Phone string `json:"phone_number"`
+	Role  string `json:"role"`
 }
 
 type batchItem struct {
@@ -101,7 +102,7 @@ func cors(origin string, next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", requestOrigin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
@@ -275,10 +276,17 @@ func (a *api) discoveredSipgoURLs(ctx context.Context) []string {
 	}
 	return targets
 }
-func chooseNode(nodes []node) (node, error) {
+func chooseNode(nodes []node, callRole string) (node, error) {
 	var best node
 	ok := false
 	for _, n := range nodes {
+		// Host and listener calls belong on leaf/listener media nodes. Root
+		// nodes are reserved for room media placement by the RustPBX layer.
+		if strings.EqualFold(callRole, "HOST") || strings.EqualFold(callRole, "LISTENER") {
+			if strings.EqualFold(n.Role, "root") || strings.EqualFold(n.Role, "mixer") {
+				continue
+			}
+		}
 		if n.ControlURL == "" || n.DrainState == "DRAINING" || n.DrainState == "DRAINED" || n.Capacity <= n.ActiveCalls {
 			continue
 		}
@@ -336,7 +344,7 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,name,status,created_at FROM bridges WHERE workspace_id=$1 ORDER BY created_at DESC`, workspaceID)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,name,status,room_state,COALESCE(host_name,''),COALESCE(host_phone,''),created_at FROM bridges WHERE workspace_id=$1 ORDER BY created_at DESC`, workspaceID)
 		if err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -344,10 +352,10 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var id, name, status string
+			var id, name, status, roomState, hostName, hostPhone string
 			var created time.Time
-			_ = rows.Scan(&id, &name, &status, &created)
-			out = append(out, map[string]any{"id": id, "name": name, "status": status, "created_at": created})
+			_ = rows.Scan(&id, &name, &status, &roomState, &hostName, &hostPhone, &created)
+			out = append(out, map[string]any{"id": id, "name": name, "status": status, "room_state": roomState, "host_name": hostName, "host_phone": hostPhone, "created_at": created})
 		}
 		a.json(w, 200, out)
 	case http.MethodPost:
@@ -392,6 +400,26 @@ func (a *api) bridge(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "dial" && r.Method == http.MethodPost {
 		a.dial(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "host" && (r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+		a.host(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "participants" && r.Method == http.MethodPost {
+		a.addRosterParticipant(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "start" && r.Method == http.MethodPost {
+		a.startRoom(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "stop" && r.Method == http.MethodPost {
+		a.stopRoom(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "sessions" && r.Method == http.MethodGet {
+		a.listSessions(w, r, workspaceID, bridgeID)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "batches" && r.Method == http.MethodPost {
@@ -457,13 +485,22 @@ func (a *api) deleteBridge(w http.ResponseWriter, r *http.Request, workspaceID, 
 }
 
 func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
+	var roomState, hostName, hostPhone string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2`, id, workspaceID).Scan(&roomState, &hostName, &hostPhone); err != nil {
+		if err == sql.ErrNoRows {
+			a.json(w, 404, map[string]string{"error": "room not found"})
+			return
+		}
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	currentEpochs := map[string]int64{}
 	if nodes, nodeErr := a.nodes(r.Context()); nodeErr == nil {
 		for _, current := range nodes {
 			currentEpochs[current.NodeID] = current.NodeEpoch
 		}
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT p.id::text,p.display_name,p.phone_number,p.desired_state,COALESCE(c.id::text,''),COALESCE(c.state,''),COALESCE(c.node_id,''),COALESCE(c.node_epoch,0) FROM participants p LEFT JOIN LATERAL (SELECT * FROM call_legs WHERE participant_id=p.id AND workspace_id=$2 ORDER BY created_at DESC LIMIT 1)c ON true WHERE p.bridge_id=$1 AND p.workspace_id=$2 ORDER BY p.created_at`, id, workspaceID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT p.id::text,p.display_name,p.phone_number,COALESCE(p.role,'LISTENER'),p.desired_state,COALESCE(c.id::text,''),COALESCE(c.state,''),COALESCE(c.node_id,''),COALESCE(c.node_epoch,0) FROM participants p LEFT JOIN LATERAL (SELECT * FROM call_legs WHERE participant_id=p.id AND workspace_id=$2 ORDER BY created_at DESC LIMIT 1)c ON true WHERE p.bridge_id=$1 AND p.workspace_id=$2 ORDER BY CASE WHEN p.role='HOST' THEN 0 ELSE 1 END,p.created_at`, id, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -471,9 +508,9 @@ func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, i
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var pid, name, phone, desired, callID, state, nodeID string
+		var pid, name, phone, role, desired, callID, state, nodeID string
 		var epoch int64
-		_ = rows.Scan(&pid, &name, &phone, &desired, &callID, &state, &nodeID, &epoch)
+		_ = rows.Scan(&pid, &name, &phone, &role, &desired, &callID, &state, &nodeID, &epoch)
 		if callID != "" && state != "" && state != "ENDED" && state != "FAILED" && state != "DROPPED" {
 			if current, ok := currentEpochs[nodeID]; ok && epoch != 0 && current != epoch {
 				staleCallID := callID
@@ -481,7 +518,7 @@ func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, i
 				_, _ = a.db.ExecContext(r.Context(), `UPDATE call_legs SET state='ENDED',ended_at=COALESCE(ended_at,now()),updated_at=now(),last_error='sidecar epoch changed; call no longer active' WHERE id=$1 AND workspace_id=$2 AND state NOT IN ('ENDED','FAILED','DROPPED')`, staleCallID, workspaceID)
 			}
 		}
-		out = append(out, map[string]any{"participant_id": pid, "name": name, "phone_number": phone, "desired_state": desired, "call_id": callID, "state": state, "node_id": nodeID})
+		out = append(out, map[string]any{"participant_id": pid, "name": name, "phone_number": phone, "role": normalizeParticipantRole(role), "desired_state": desired, "call_id": callID, "state": state, "node_id": nodeID})
 	}
 	requestRows, err := a.db.QueryContext(r.Context(), `SELECT id::text,participant_id::text,status,digit,requested_at,COALESCE(granted_by,'') FROM speaker_requests WHERE workspace_id=$1 AND bridge_id=$2 AND status IN ('QUEUED','GRANTED','ACTIVE') ORDER BY requested_at`, workspaceID, id)
 	if err != nil {
@@ -497,41 +534,400 @@ func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, i
 			requests = append(requests, map[string]any{"id": requestID, "participant_id": participantID, "status": requestStatus, "digit": digit, "requested_at": requestedAt, "granted_by": grantedBy})
 		}
 	}
-	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "participants": out, "speaker_requests": requests})
+	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "room_state": roomState, "host": map[string]string{"name": hostName, "phone_number": hostPhone}, "participants": out, "speaker_requests": requests, "sessions": a.sessionRows(r.Context(), workspaceID, id)})
 }
 
-func (a *api) dispatchDial(ctx context.Context, workspaceID, bridgeID, name, phone string) (map[string]any, error) {
+func (a *api) sessionRows(ctx context.Context, workspaceID, bridgeID string) []map[string]any {
+	rows, err := a.db.QueryContext(ctx, `SELECT rs.id::text,rs.status,rs.started_at,rs.ended_at,COALESCE(rs.duration_seconds,EXTRACT(EPOCH FROM (COALESCE(rs.ended_at,now())-rs.started_at))::bigint),COALESCE(json_agg(json_build_object('participant_id',rsp.participant_id::text,'name',rsp.display_name,'phone_number',rsp.phone_number,'role',rsp.role,'state',rsp.call_state,'joined_at',rsp.joined_at,'left_at',rsp.left_at) ORDER BY rsp.created_at) FILTER (WHERE rsp.id IS NOT NULL),'[]'::json) FROM room_sessions rs LEFT JOIN room_session_participants rsp ON rsp.session_id=rs.id WHERE rs.workspace_id=$1 AND rs.bridge_id=$2 GROUP BY rs.id ORDER BY rs.started_at DESC LIMIT 25`, workspaceID, bridgeID)
+	if err != nil {
+		return []map[string]any{}
+	}
+	defer rows.Close()
+	result := []map[string]any{}
+	for rows.Next() {
+		var id, status string
+		var startedAt, endedAt sql.NullTime
+		var duration int64
+		var participants []byte
+		if rows.Scan(&id, &status, &startedAt, &endedAt, &duration, &participants) != nil {
+			continue
+		}
+		var roster any
+		if json.Unmarshal(participants, &roster) != nil {
+			roster = []any{}
+		}
+		row := map[string]any{"session_id": id, "status": status, "duration_seconds": duration, "participants": roster}
+		if startedAt.Valid {
+			row["started_at"] = startedAt.Time
+		}
+		if endedAt.Valid {
+			row["ended_at"] = endedAt.Time
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+func (a *api) host(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	var roomState string
+	if err := tx.QueryRowContext(r.Context(), `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2 FOR UPDATE`, bridgeID, workspaceID).Scan(&roomState); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before editing its host"})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE bridges SET host_name=NULL,host_phone=NULL,updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `DELETE FROM participants WHERE bridge_id=$1 AND workspace_id=$2 AND role='HOST'`, bridgeID, workspaceID); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		a.json(w, 200, map[string]string{"status": "host_cleared", "bridge_id": bridgeID})
+		return
+	}
+	var in struct {
+		Name  string `json:"name"`
+		Phone string `json:"phone_number"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Phone) == "" {
+		a.json(w, 400, map[string]string{"error": "host name and phone_number are required"})
+		return
+	}
+	in.Name, in.Phone = strings.TrimSpace(in.Name), strings.TrimSpace(in.Phone)
+	if _, err := tx.ExecContext(r.Context(), `UPDATE bridges SET host_name=$1,host_phone=$2,updated_at=now() WHERE id=$3 AND workspace_id=$4`, in.Name, in.Phone, bridgeID, workspaceID); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	var hostID string
+	err = tx.QueryRowContext(r.Context(), `SELECT id::text FROM participants WHERE bridge_id=$1 AND workspace_id=$2 AND role='HOST' LIMIT 1`, bridgeID, workspaceID).Scan(&hostID)
+	if err == sql.ErrNoRows {
+		err = tx.QueryRowContext(r.Context(), `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'HOST','ACTIVE') RETURNING id::text`, workspaceID, bridgeID, in.Name, in.Phone).Scan(&hostID)
+	} else if err == nil {
+		_, err = tx.ExecContext(r.Context(), `UPDATE participants SET display_name=$1,phone_number=$2,desired_state='ACTIVE' WHERE id=$3 AND workspace_id=$4`, in.Name, in.Phone, hostID, workspaceID)
+	}
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 200, map[string]any{"status": "saved", "bridge_id": bridgeID, "host": map[string]string{"participant_id": hostID, "name": in.Name, "phone_number": in.Phone}})
+}
+
+func (a *api) addRosterParticipant(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	var roomState string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before editing its participant roster"})
+		return
+	}
+	var in struct {
+		Name  string `json:"name"`
+		Phone string `json:"phone_number"`
+		Role  string `json:"role"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Phone) == "" {
+		a.json(w, 400, map[string]string{"error": "name and phone_number are required"})
+		return
+	}
+	if normalizeParticipantRole(in.Role) == "HOST" {
+		a.json(w, 400, map[string]string{"error": "configure the room host in room settings"})
+		return
+	}
+	var id string
+	if err := a.db.QueryRowContext(r.Context(), `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'LISTENER','MUTED') RETURNING id::text`, workspaceID, bridgeID, strings.TrimSpace(in.Name), strings.TrimSpace(in.Phone)).Scan(&id); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 201, map[string]any{"participant_id": id, "name": in.Name, "phone_number": in.Phone, "role": "LISTENER", "state": "ROSTERED"})
+}
+
+func (a *api) editRosterParticipant(w http.ResponseWriter, r *http.Request, participantID string) {
+	workspaceID, ok := a.requireWorkspace(w, r)
+	if !ok {
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	var bridgeID, role, roomState string
+	if err := tx.QueryRowContext(r.Context(), `SELECT p.bridge_id::text,p.role,b.room_state FROM participants p JOIN bridges b ON b.id=p.bridge_id WHERE p.id=$1 AND p.workspace_id=$2 FOR UPDATE`, participantID, workspaceID).Scan(&bridgeID, &role, &roomState); err != nil {
+		a.json(w, 404, map[string]string{"error": "participant not found"})
+		return
+	}
+	if role == "HOST" {
+		a.json(w, 400, map[string]string{"error": "edit the host from Room settings"})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before editing its participant roster"})
+		return
+	}
+	var in struct {
+		Name  string `json:"name"`
+		Phone string `json:"phone_number"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Phone) == "" {
+		a.json(w, 400, map[string]string{"error": "name and phone_number are required"})
+		return
+	}
+	in.Name, in.Phone = strings.TrimSpace(in.Name), strings.TrimSpace(in.Phone)
+	if _, err := tx.ExecContext(r.Context(), `UPDATE participants SET display_name=$1,phone_number=$2 WHERE id=$3 AND workspace_id=$4`, in.Name, in.Phone, participantID, workspaceID); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE dial_batch_items SET name=$1,phone_number=$2,updated_at=now() WHERE participant_id=$3 AND workspace_id=$4`, in.Name, in.Phone, participantID, workspaceID); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 200, map[string]any{"status": "saved", "participant_id": participantID, "bridge_id": bridgeID, "name": in.Name, "phone_number": in.Phone, "role": "LISTENER"})
+}
+
+func (a *api) startRoom(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	var roomState, hostName, hostPhone string
+	if err := tx.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2 FOR UPDATE`, bridgeID, workspaceID).Scan(&roomState, &hostName, &hostPhone); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "room is already running"})
+		return
+	}
+	if strings.TrimSpace(hostName) == "" || strings.TrimSpace(hostPhone) == "" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "configure a host before starting the room"})
+		return
+	}
+	var hostID string
+	err = tx.QueryRowContext(r.Context(), `SELECT id::text FROM participants WHERE bridge_id=$1 AND workspace_id=$2 AND role='HOST' LIMIT 1`, bridgeID, workspaceID).Scan(&hostID)
+	if err == sql.ErrNoRows {
+		err = tx.QueryRowContext(r.Context(), `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'HOST','ACTIVE') RETURNING id::text`, workspaceID, bridgeID, hostName, hostPhone).Scan(&hostID)
+	}
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	var sessionID string
+	if err := tx.QueryRowContext(r.Context(), `INSERT INTO room_sessions(workspace_id,bridge_id,host_participant_id,status) VALUES($1,$2,$3,'STARTING') RETURNING id::text`, workspaceID, bridgeID, hostID).Scan(&sessionID); err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "room already has an active session"})
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE bridges SET room_state='STARTING',updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	hostCall, err := a.dispatchExistingParticipant(r.Context(), workspaceID, bridgeID, hostID, sessionID)
+	if err != nil {
+		_, _ = a.db.ExecContext(r.Context(), `UPDATE room_sessions SET status='FAILED',ended_at=now(),duration_seconds=0 WHERE id=$1`, sessionID)
+		_, _ = a.db.ExecContext(r.Context(), `UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID)
+		a.json(w, 502, map[string]string{"error": "host call could not be dispatched: " + err.Error()})
+		return
+	}
+	go a.activateRoomAfterHost(sessionID, workspaceID, bridgeID, hostCall["call_id"].(string))
+	a.json(w, http.StatusAccepted, map[string]any{"session_id": sessionID, "room_state": "STARTING", "host": hostCall})
+}
+
+func (a *api) activateRoomAfterHost(sessionID, workspaceID, bridgeID, hostCallID string) {
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		var state string
+		if err := a.db.QueryRow(`SELECT state FROM call_legs WHERE id=$1`, hostCallID).Scan(&state); err == nil {
+			if state == "ANSWERED" || state == "IN_BRIDGE" {
+				result, updateErr := a.db.Exec(`UPDATE room_sessions SET status='RUNNING' WHERE id=$1 AND status='STARTING'`, sessionID)
+				if updateErr != nil {
+					return
+				}
+				changed, _ := result.RowsAffected()
+				if changed != 1 {
+					// Stop Room may have closed the session while the host call was
+					// still transitioning. Never resurrect a stopped room.
+					return
+				}
+				_, _ = a.db.Exec(`UPDATE bridges SET room_state='RUNNING',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND room_state='STARTING'`, bridgeID, workspaceID)
+				rows, _ := a.db.Query(`SELECT id::text FROM participants WHERE bridge_id=$1 AND workspace_id=$2 AND role='LISTENER' ORDER BY created_at`, bridgeID, workspaceID)
+				var ids []string
+				if rows != nil {
+					for rows.Next() {
+						var id string
+						if rows.Scan(&id) == nil {
+							ids = append(ids, id)
+						}
+					}
+					rows.Close()
+				}
+				var wg sync.WaitGroup
+				semaphore := make(chan struct{}, 32)
+				for _, participantID := range ids {
+					participantID := participantID
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						semaphore <- struct{}{}
+						defer func() { <-semaphore }()
+						_, _ = a.dispatchExistingParticipant(context.Background(), workspaceID, bridgeID, participantID, sessionID)
+					}()
+				}
+				wg.Wait()
+				return
+			}
+			if state == "FAILED" || state == "ENDED" || state == "DROPPED" {
+				_, _ = a.db.Exec(`UPDATE room_sessions SET status='FAILED',ended_at=now() WHERE id=$1 AND status='STARTING'`, sessionID)
+				_, _ = a.db.Exec(`UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID)
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	_, _ = a.db.Exec(`UPDATE room_sessions SET status='FAILED',ended_at=now() WHERE id=$1 AND status='STARTING'`, sessionID)
+	_, _ = a.db.Exec(`UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID)
+}
+
+func (a *api) stopRoom(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	var sessionID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT id::text FROM room_sessions WHERE bridge_id=$1 AND workspace_id=$2 AND status IN ('STARTING','RUNNING') ORDER BY started_at DESC LIMIT 1`, bridgeID, workspaceID).Scan(&sessionID); err != nil {
+		if err == sql.ErrNoRows {
+			a.json(w, 200, map[string]string{"status": "already_stopped", "room_state": "READY"})
+			return
+		}
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,participant_id::text,node_id,node_epoch FROM call_legs WHERE bridge_id=$1 AND workspace_id=$2 AND state NOT IN ('ENDED','FAILED','DROPPED')`, bridgeID, workspaceID)
+	if err == nil {
+		for rows.Next() {
+			var callID, participantID, nodeID string
+			var epoch int64
+			if rows.Scan(&callID, &participantID, &nodeID, &epoch) == nil {
+				_ = a.dropCall(r.Context(), workspaceID, callID, participantID, nodeID, epoch)
+			}
+		}
+		rows.Close()
+	}
+	_, _ = a.db.ExecContext(r.Context(), `UPDATE room_sessions SET status='ENDED',ended_at=now(),duration_seconds=EXTRACT(EPOCH FROM (now()-started_at))::bigint WHERE id=$1 AND workspace_id=$2`, sessionID, workspaceID)
+	_, _ = a.db.ExecContext(r.Context(), `UPDATE room_session_participants SET left_at=COALESCE(left_at,now()) WHERE session_id=$1 AND left_at IS NULL`, sessionID)
+	_, _ = a.db.ExecContext(r.Context(), `UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID)
+	a.json(w, 200, map[string]string{"status": "stopped", "room_state": "READY", "session_id": sessionID})
+}
+
+func (a *api) listSessions(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": bridgeID, "sessions": a.sessionRows(r.Context(), workspaceID, bridgeID)})
+}
+
+func (a *api) dropCall(ctx context.Context, workspaceID, callID, participantID, nodeID string, nodeEpoch int64) error {
+	nodes, err := a.nodes(ctx)
+	if err != nil {
+		return err
+	}
+	var owner node
+	for _, candidate := range nodes {
+		if candidate.NodeID == nodeID {
+			owner = candidate
+			break
+		}
+	}
+	if owner.NodeID == "" {
+		return fmt.Errorf("owning PBX is unavailable")
+	}
+	command := newID()
+	if err := a.sidecar(ctx, owner, "/v1/participants/"+participantID+"/drop", map[string]any{"command_id": command, "call_id": callID, "participant_id": participantID, "node_epoch": nodeEpoch}); err != nil {
+		return err
+	}
+	_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='DROPPED',ended_at=COALESCE(ended_at,now()),updated_at=now() WHERE id=$1 AND workspace_id=$2`, callID, workspaceID)
+	return nil
+}
+
+func normalizeParticipantRole(role string) string {
+	if strings.EqualFold(strings.TrimSpace(role), "HOST") {
+		return "HOST"
+	}
+	return "LISTENER"
+}
+
+func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, bridgeID, participantID, sessionID string) (map[string]any, error) {
+	var name, phone, role string
+	if err := a.db.QueryRowContext(ctx, `SELECT display_name,phone_number,COALESCE(role,'LISTENER') FROM participants WHERE id=$1 AND workspace_id=$2 AND bridge_id=$3`, participantID, workspaceID, bridgeID).Scan(&name, &phone, &role); err != nil {
+		return nil, err
+	}
+	role = normalizeParticipantRole(role)
 	nodes, err := a.nodes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	n, err := chooseNode(nodes)
+	n, err := chooseNode(nodes, role)
 	if err != nil {
 		return nil, err
 	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	var pid, cid string
-	if err = tx.QueryRowContext(ctx, `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number) VALUES($1,$2,$3,$4) RETURNING id::text`, workspaceID, bridgeID, coalesce(name, phone), phone).Scan(&pid); err != nil {
-		return nil, err
-	}
-	if err = tx.QueryRowContext(ctx, `INSERT INTO call_legs(workspace_id,participant_id,bridge_id,node_id,node_epoch,sidecar_instance_id,state) VALUES($1,$2,$3,$4,$5,'','DISPATCHED') RETURNING id::text`, workspaceID, pid, bridgeID, n.NodeID, n.NodeEpoch).Scan(&cid); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
+	desiredMute := role != "HOST"
+	var callID string
+	if err := a.db.QueryRowContext(ctx, `INSERT INTO call_legs(workspace_id,participant_id,bridge_id,node_id,node_epoch,sidecar_instance_id,state,desired_mute) VALUES($1,$2,$3,$4,$5,'','DISPATCHED',$6) RETURNING id::text`, workspaceID, participantID, bridgeID, n.NodeID, n.NodeEpoch, desiredMute).Scan(&callID); err != nil {
 		return nil, err
 	}
 	command := newID()
-	body := map[string]any{"command_id": command, "call_id": cid, "bridge_id": bridgeID, "participant_id": pid, "destination": phone}
+	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": phone, "role": role, "desired_mute": desiredMute}
 	if err := a.sidecar(ctx, n, "/v1/calls/originate", body); err != nil {
-		_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='FAILED',last_error=$1,updated_at=now() WHERE id=$2`, err.Error(), cid)
+		_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='FAILED',last_error=$1,ended_at=now(),updated_at=now() WHERE id=$2`, err.Error(), callID)
 		return nil, err
 	}
-	_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='DISPATCHED',updated_at=now() WHERE id=$1`, cid)
-	return map[string]any{"participant_id": pid, "call_id": cid, "node_id": n.NodeID, "state": "DISPATCHED"}, nil
+	participantState := "MUTED"
+	if role == "HOST" {
+		participantState = "ACTIVE"
+	}
+	_, _ = a.db.ExecContext(ctx, `UPDATE participants SET desired_state=$1 WHERE id=$2 AND workspace_id=$3`, participantState, participantID, workspaceID)
+	if sessionID != "" {
+		_, _ = a.db.ExecContext(ctx, `INSERT INTO room_session_participants(session_id,participant_id,call_leg_id,display_name,phone_number,role,call_state) VALUES($1,$2,$3,$4,$5,$6,'DISPATCHED')`, sessionID, participantID, callID, name, phone, role)
+	}
+	return map[string]any{"participant_id": participantID, "call_id": callID, "node_id": n.NodeID, "role": role, "state": "DISPATCHED"}, nil
+}
+
+func (a *api) dispatchDial(ctx context.Context, workspaceID, bridgeID, name, phone string) (map[string]any, error) {
+	var roomState string
+	if err := a.db.QueryRowContext(ctx, `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState); err != nil {
+		return nil, err
+	}
+	if roomState != "RUNNING" {
+		return nil, errors.New("start the room before using the live dialer")
+	}
+	var participantID string
+	if err := a.db.QueryRowContext(ctx, `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'LISTENER','MUTED') RETURNING id::text`, workspaceID, bridgeID, coalesce(name, phone), phone).Scan(&participantID); err != nil {
+		return nil, err
+	}
+	return a.dispatchExistingParticipant(ctx, workspaceID, bridgeID, participantID, "")
 }
 
 func (a *api) dial(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
@@ -565,6 +961,10 @@ func (a *api) action(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/participants/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) != 2 {
+		if len(parts) == 1 && r.Method == http.MethodPut {
+			a.editRosterParticipant(w, r, parts[0])
+			return
+		}
 		w.WriteHeader(404)
 		return
 	}
@@ -575,6 +975,29 @@ func (a *api) action(w http.ResponseWriter, r *http.Request) {
 	}
 	if action == "add" {
 		a.addParticipant(w, r, pid)
+		return
+	}
+	if action == "remove" {
+		var active int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM call_legs WHERE participant_id=$1 AND workspace_id=$2 AND state NOT IN ('ENDED','FAILED','DROPPED')`, pid, workspaceID).Scan(&active); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if active > 0 {
+			a.json(w, http.StatusConflict, map[string]string{"error": "drop the active call before removing the roster participant"})
+			return
+		}
+		result, err := a.db.ExecContext(r.Context(), `DELETE FROM participants WHERE id=$1 AND workspace_id=$2 AND role <> 'HOST'`, pid, workspaceID)
+		if err != nil {
+			a.json(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		count, _ := result.RowsAffected()
+		if count == 0 {
+			a.json(w, 404, map[string]string{"error": "roster participant not found"})
+			return
+		}
+		a.json(w, 200, map[string]any{"status": "removed", "participant_id": pid})
 		return
 	}
 	if action != "mute" && action != "unmute" && action != "drop" {
@@ -663,35 +1086,22 @@ func (a *api) addParticipant(w http.ResponseWriter, r *http.Request, participant
 	if !ok {
 		return
 	}
-	var bridgeID, name, phone string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT bridge_id::text,display_name,phone_number FROM participants WHERE id=$1 AND workspace_id=$2`, participantID, workspaceID).Scan(&bridgeID, &name, &phone); err != nil {
+	var bridgeID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT bridge_id::text FROM participants WHERE id=$1 AND workspace_id=$2`, participantID, workspaceID).Scan(&bridgeID); err != nil {
 		a.json(w, 404, map[string]string{"error": "participant not found"})
 		return
 	}
-	nodes, err := a.nodes(r.Context())
+	var roomState string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState); err != nil || roomState != "RUNNING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "start the room before adding a participant call"})
+		return
+	}
+	result, err := a.dispatchExistingParticipant(r.Context(), workspaceID, bridgeID, participantID, "")
 	if err != nil {
-		a.json(w, 503, map[string]string{"error": err.Error()})
-		return
-	}
-	n, err := chooseNode(nodes)
-	if err != nil {
-		a.json(w, 503, map[string]string{"error": err.Error()})
-		return
-	}
-	var callID string
-	if err := a.db.QueryRowContext(r.Context(), `INSERT INTO call_legs(workspace_id,participant_id,bridge_id,node_id,node_epoch,state) VALUES($1,$2,$3,$4,$5,'DISPATCHED') RETURNING id::text`, workspaceID, participantID, bridgeID, n.NodeID, n.NodeEpoch).Scan(&callID); err != nil {
-		a.json(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	command := newID()
-	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": phone}
-	if err := a.sidecar(r.Context(), n, "/v1/calls/originate", body); err != nil {
-		_, _ = a.db.ExecContext(r.Context(), `UPDATE call_legs SET state='FAILED',last_error=$1,updated_at=now() WHERE id=$2`, err.Error(), callID)
 		a.json(w, 502, map[string]string{"error": err.Error()})
 		return
 	}
-	_, _ = a.db.ExecContext(r.Context(), `UPDATE participants SET desired_state='ACTIVE' WHERE id=$1 AND workspace_id=$2`, participantID, workspaceID)
-	a.json(w, 202, map[string]any{"workspace_id": workspaceID, "participant_id": participantID, "call_id": callID, "node_id": n.NodeID, "state": "DISPATCHED"})
+	a.json(w, 202, result)
 }
 
 func (a *api) batch(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
@@ -704,27 +1114,80 @@ func (a *api) batch(w http.ResponseWriter, r *http.Request, workspaceID, bridgeI
 		a.json(w, 400, map[string]string{"error": "contacts required"})
 		return
 	}
-	if in.Concurrency <= 0 {
-		in.Concurrency = 16
+	var roomState, existingHostName, existingHostPhone string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState, &existingHostName, &existingHostPhone); err != nil {
+		a.json(w, 404, map[string]string{"error": "room not found"})
+		return
 	}
-	if in.Rate <= 0 {
-		in.Rate = 8
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before importing its fixed roster"})
+		return
 	}
-	var batchID string
-	if err := a.db.QueryRowContext(r.Context(), `INSERT INTO dial_batches(workspace_id,bridge_id,concurrency,rate_per_second) VALUES($1,$2,$3,$4) RETURNING id::text`, workspaceID, bridgeID, in.Concurrency, in.Rate).Scan(&batchID); err != nil {
+	hostCount := 0
+	for _, contact := range in.Contacts {
+		if normalizeParticipantRole(contact.Role) == "HOST" {
+			hostCount++
+		}
+		if strings.TrimSpace(contact.Phone) == "" || strings.TrimSpace(contact.Name) == "" {
+			a.json(w, 400, map[string]string{"error": "every roster row requires name and phone_number"})
+			return
+		}
+	}
+	if hostCount > 1 {
+		a.json(w, 400, map[string]string{"error": "bulk upload may contain at most one HOST row"})
+		return
+	}
+	if hostCount == 1 && existingHostPhone != "" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "this room already has a host; edit the host in Room settings before importing another one"})
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	items := make([]batchItem, 0, len(in.Contacts))
-	for _, contact := range in.Contacts {
-		var itemID string
-		if err := a.db.QueryRowContext(r.Context(), `INSERT INTO dial_batch_items(workspace_id,batch_id,name,phone_number) VALUES($1,$2,$3,$4) RETURNING id::text`, workspaceID, batchID, coalesce(contact.Name, contact.Phone), contact.Phone).Scan(&itemID); err == nil {
-			items = append(items, batchItem{ID: itemID, Name: coalesce(contact.Name, contact.Phone), Phone: contact.Phone})
-		}
+	defer tx.Rollback()
+	var batchID string
+	if err := tx.QueryRowContext(r.Context(), `INSERT INTO dial_batches(workspace_id,bridge_id,status,concurrency,rate_per_second) VALUES($1,$2,'IMPORTED',$3,$4) RETURNING id::text`, workspaceID, bridgeID, maxInt(in.Concurrency, 16), maxInt(in.Rate, 8)).Scan(&batchID); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
 	}
-	a.worker.Add(1)
-	go a.runBatch(batchID, workspaceID, bridgeID, items, in.Concurrency, in.Rate)
-	a.json(w, 202, map[string]any{"batch_id": batchID, "status": "QUEUED", "count": len(in.Contacts)})
+	count := 0
+	for _, contact := range in.Contacts {
+		name, phone := strings.TrimSpace(contact.Name), strings.TrimSpace(contact.Phone)
+		role := normalizeParticipantRole(contact.Role)
+		var participantID string
+		if role == "HOST" {
+			if err := tx.QueryRowContext(r.Context(), `UPDATE bridges SET host_name=$1,host_phone=$2,updated_at=now() WHERE id=$3 AND workspace_id=$4 RETURNING id::text`, name, phone, bridgeID, workspaceID).Scan(new(string)); err != nil {
+				a.json(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			if err := tx.QueryRowContext(r.Context(), `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'HOST','ACTIVE') RETURNING id::text`, workspaceID, bridgeID, name, phone).Scan(&participantID); err != nil {
+				a.json(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+		} else if err := tx.QueryRowContext(r.Context(), `INSERT INTO participants(workspace_id,bridge_id,display_name,phone_number,role,desired_state) VALUES($1,$2,$3,$4,'LISTENER','MUTED') RETURNING id::text`, workspaceID, bridgeID, name, phone).Scan(&participantID); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO dial_batch_items(workspace_id,batch_id,name,phone_number,status,participant_id) VALUES($1,$2,$3,$4,'ROSTERED',$5)`, workspaceID, batchID, name, phone, participantID); err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		count++
+	}
+	if err := tx.Commit(); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 201, map[string]any{"batch_id": batchID, "status": "IMPORTED", "count": count, "message": "fixed roster imported; start the room to call the host first, then listeners"})
+}
+
+func maxInt(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 func (a *api) runBatch(batchID, workspaceID, bridgeID string, items []batchItem, concurrency, rate int) {
@@ -961,8 +1424,28 @@ func (a *api) events(w http.ResponseWriter, r *http.Request) {
 	if id != "" && state != "" {
 		_, _ = a.db.ExecContext(r.Context(), `UPDATE call_legs SET state=$1,pbx_member_id=COALESCE(NULLIF($2,''),pbx_member_id),updated_at=now(),answered_at=CASE WHEN $1='ANSWERED' THEN now() ELSE answered_at END,ended_at=CASE WHEN $1 IN ('ENDED','FAILED','DROPPED') THEN now() ELSE ended_at END WHERE id=$3`, state, e.Call.PBXMemberID, id)
 		_, _ = a.db.ExecContext(r.Context(), `UPDATE dial_batch_items SET status=$1,updated_at=now() WHERE participant_id=(SELECT participant_id FROM call_legs WHERE id=$2)`, state, id)
+		_, _ = a.db.ExecContext(r.Context(), `UPDATE room_session_participants SET call_state=$1,joined_at=CASE WHEN $1 IN ('ANSWERED','IN_BRIDGE') THEN COALESCE(joined_at,now()) ELSE joined_at END,left_at=CASE WHEN $1 IN ('ENDED','FAILED','DROPPED') THEN COALESCE(left_at,now()) ELSE left_at END WHERE call_leg_id=$2`, state, id)
+		a.finishHostSession(r.Context(), id, state)
 	}
 	a.json(w, 202, map[string]string{"status": "accepted"})
+}
+
+func (a *api) finishHostSession(ctx context.Context, callID, state string) {
+	if state != "ENDED" && state != "FAILED" && state != "DROPPED" {
+		return
+	}
+	var sessionID, sessionStatus, bridgeID, workspaceID string
+	err := a.db.QueryRowContext(ctx, `SELECT rs.id::text,rs.status,rs.bridge_id::text,rs.workspace_id::text FROM room_sessions rs JOIN room_session_participants rsp ON rsp.session_id=rs.id JOIN participants p ON p.id=rsp.participant_id WHERE rsp.call_leg_id=$1 AND p.role='HOST' AND rs.status IN ('STARTING','RUNNING') LIMIT 1`, callID).Scan(&sessionID, &sessionStatus, &bridgeID, &workspaceID)
+	if err != nil {
+		return
+	}
+	terminal := "ENDED"
+	if sessionStatus == "STARTING" {
+		terminal = "FAILED"
+	}
+	_, _ = a.db.ExecContext(ctx, `UPDATE room_sessions SET status=$1,ended_at=COALESCE(ended_at,now()),duration_seconds=EXTRACT(EPOCH FROM (COALESCE(ended_at,now())-started_at))::bigint WHERE id=$2 AND status IN ('STARTING','RUNNING')`, terminal, sessionID)
+	_, _ = a.db.ExecContext(ctx, `UPDATE room_session_participants SET left_at=COALESCE(left_at,now()) WHERE session_id=$1 AND left_at IS NULL`, sessionID)
+	_, _ = a.db.ExecContext(ctx, `UPDATE bridges SET room_state='READY',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND room_state IN ('STARTING','RUNNING')`, bridgeID, workspaceID)
 }
 
 func main() {

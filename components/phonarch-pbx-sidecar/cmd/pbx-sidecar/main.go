@@ -130,6 +130,8 @@ type callState struct {
 	ParticipantID string    `json:"participant_id"`
 	PBXMemberID   string    `json:"pbx_member_id,omitempty"`
 	Destination   string    `json:"destination"`
+	Role          string    `json:"role,omitempty"`
+	DesiredMute   bool      `json:"desired_mute"`
 	State         string    `json:"state"`
 	Muted         bool      `json:"muted"`
 	VolumeDB      float64   `json:"volume_db,omitempty"`
@@ -235,6 +237,8 @@ func (s *server) originate(w http.ResponseWriter, r *http.Request) {
 		BridgeID      string `json:"bridge_id"`
 		ParticipantID string `json:"participant_id"`
 		Destination   string `json:"destination"`
+		Role          string `json:"role"`
+		DesiredMute   bool   `json:"desired_mute"`
 	}
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.CallID == "" || in.Destination == "" {
 		s.write(w, 400, map[string]string{"error": "call_id and destination are required"})
@@ -261,7 +265,7 @@ func (s *server) originate(w http.ResponseWriter, r *http.Request) {
 		s.write(w, 502, map[string]string{"error": err.Error()})
 		return
 	}
-	call := callState{CallID: in.CallID, BridgeID: in.BridgeID, ParticipantID: in.ParticipantID, PBXMemberID: out.PBXMemberID, Destination: in.Destination, State: "DISPATCHED", UpdatedAt: time.Now()}
+	call := callState{CallID: in.CallID, BridgeID: in.BridgeID, ParticipantID: in.ParticipantID, PBXMemberID: out.PBXMemberID, Destination: in.Destination, State: "DISPATCHED", Muted: in.DesiredMute, UpdatedAt: time.Now()}
 	s.state.mu.Lock()
 	s.state.calls[in.CallID] = call
 	s.state.commands[in.CommandID], _ = json.Marshal(call)

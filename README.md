@@ -64,14 +64,19 @@ The room is also the media-control and failure-fencing boundary. Media commands 
 
 1. An operator logs in to a workspace.
 2. The operator creates a conference room.
-3. A direct dial or an XLSX/CSV batch attaches contacts to that room.
-4. The control API selects a healthy PBX node and creates a participant and call leg before dispatch.
-5. SipGo routes the SIP dialog to the selected PBX and preserves affinity for every in-dialog request.
-6. The participant is muted by default after answer.
-7. The host broadcast is delivered to listeners through the room's media tree.
-8. A caller presses `0`; the DTMF event enters the room's speaker queue.
-9. The operator grants or dismisses the request. Granting sends an idempotent unmute/media command to the call's owning PBX.
-10. The operator can mute, inspect volume, or drop a participant. Dropped participants remain in room history and can be called again.
+3. In Room settings, the operator configures exactly one fixed host with a name and phone number.
+4. Fixed listeners are added manually or imported from XLSX/CSV. The upload columns are `Name`, `Phone Number`, and `Role`; `Role` is `HOST` or `LISTENER`. A bulk import stages the roster and never starts calls.
+5. The operator reviews and edits the host and listener roster while the room is stopped.
+6. Start Room creates a durable room session, calls the host first, and only fans out listener calls after the host reaches `ANSWERED`/`IN_BRIDGE`.
+7. The control API selects a healthy leaf PBX for each call and records `node_id` plus `node_epoch` on the call leg. Host placement is dynamic; there is no host server.
+8. SipGo routes each SIP dialog to the selected PBX and preserves affinity for every in-dialog request.
+9. Listener calls start muted. The host broadcast is delivered through the room's media tree.
+10. A caller presses `0`; the DTMF event enters this room's speaker queue. `#` withdraws the request.
+11. The operator grants or dismisses the request. Granting sends an idempotent unmute/media command to the call's owning PBX.
+12. The operator can mute, inspect volume, or drop a participant. Dropped calls remain in the roster and session history and can be added back on a later session.
+13. Stop Room releases active calls, closes the session, records end time/duration and the participants included, and returns the room to `READY`.
+
+Room state is explicit: `READY -> STARTING -> RUNNING -> READY`. Host/roster edits and roster imports are rejected during `STARTING` or `RUNNING`, preventing a live session from silently changing membership. An ad-hoc live dialer exists inside Live control for exceptional callers; it creates a listener attached to the current room and is not a replacement for the fixed roster workflow.
 
 ## Protocol and deployment rules
 
@@ -252,7 +257,8 @@ The migrations are applied by `/data/deploy/scripts/init-db.sh`:
 
 - `001_initial.sql`: operators, bridges, participants, call legs, dial batches, and node commands;
 - `002_room_delete_constraints.sql`: safe room deletion behavior, including the participant/batch-item foreign-key issue;
-- `003_multitenant_media_ha.sql`: workspaces, workspace membership, workspace foreign keys, media sessions, leaf assignments, speaker requests, room events, epochs, and command metadata.
+- `003_multitenant_media_ha.sql`: workspaces, workspace membership, workspace foreign keys, media sessions, leaf assignments, speaker requests, room events, epochs, and command metadata;
+- `004_room_lifecycle_roster.sql`: room state, one fixed host, listener roles, durable room sessions, and per-session participant snapshots.
 
 Important relationships:
 
@@ -261,7 +267,8 @@ workspace
   └── bridge / conference room
         ├── participants
         │     └── call_legs -> node_id + node_epoch
-        ├── dial_batches -> dial_batch_items
+        ├── dial_batches -> dial_batch_items -> fixed roster participant
+        ├── room_sessions -> room_session_participants -> historical snapshot
         ├── room_media_sessions -> active/standby roots + room_epoch
         ├── room_leaf_assignments -> leaf node/stream ownership
         ├── speaker_requests
@@ -314,7 +321,9 @@ The API owns authenticated customer operations:
 
 - login/logout and current workspace;
 - room CRUD;
-- direct dial and bulk batch dispatch;
+- fixed host and listener roster management;
+- room start/stop lifecycle with host-first call sequencing;
+- direct live dial and bulk roster import;
 - room participant state and actions;
 - volume reads;
 - speaker request queue, grant, and withdraw;
@@ -327,12 +336,14 @@ The API binds to localhost by default. If it is exposed beyond the host, configu
 The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icons. It contains:
 
 - workspace landing page with room cards and room deletion confirmation;
-- direct SIP dialer;
-- local XLSX/CSV preview and controlled batch submission;
+- fixed host editor and editable participant roster;
+- direct SIP dialer plus live floating ad-hoc dialer;
+- local XLSX/CSV preview using `Name`, `Phone Number`, and `Role`, with roster-only submission;
+- Start Room / Stop Room controls with host-first messaging;
 - full-height room sidebar;
 - live participant controls for mute, unmute, volume, and drop;
 - moderated speaker-request queue with Allow and Dismiss actions;
-- activity and room settings surfaces.
+- activity and room settings surfaces, including session start/end/duration and member history.
 
 The CSS variables and material rules are in `/data/components/phonarch-platform-web/src/app/globals.css`: cool off-white background, frosted glass panels, mint gradients, green brand buttons, and the requested text/border/status tokens.
 

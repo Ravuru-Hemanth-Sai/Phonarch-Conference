@@ -377,8 +377,10 @@ func main() {
 	defer stop()
 	rdb := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "127.0.0.1:6379")})
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		slog.Error("redis unavailable", "error", err)
-		os.Exit(1)
+		// Redis can accept TCP connections while it is still loading an AOF/RDB
+		// and returns LOADING for a short interval. SIP should still bind during
+		// that window; registry operations will retry through the shared client.
+		slog.Warn("redis unavailable at startup; SIP edge will retry registry operations", "error", err)
 	}
 	reg := newRegistry(rdb, durationEnv("SIPGO_HEARTBEAT_LEASE", 7*time.Second))
 	go registerAdvertisement(ctx, rdb, durationEnv("SIPGO_EDGE_LEASE", 7*time.Second))
