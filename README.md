@@ -56,13 +56,13 @@ The seeded local workspace is `Operations`. It exists so the current product adm
 
 ### Product administration and access
 
-Product administration is a separate control surface at `/admin`, with its own
-login at `/admin/login` and its own `phonarch_admin_session` cookie. It is for the
-platform owner and product managers only; it is not part of the customer
-workspace navigation and a customer session cannot call the admin API. There is
-deliberately no public signup route. A product administrator creates customer
-operator accounts, assigns them to a selected workspace, sets their workspace
-role, and can suspend or reactivate them.
+Product administration has a separate login at `/admin/login` and its own
+`phonarch_admin_session` cookie. After authentication, `/admin` deliberately
+renders the same workspace landing page, room cards, room navigation, live
+controls, and settings components as `/`. The difference is authorization and
+workspace scope, not a second product UI. A product administrator can switch
+between active workspaces, create customer accounts, assign TFNs, and control
+room limits. There is deliberately no public signup route.
 
 The product admin console manages the platform-wide inventory and policy that a
 customer operator must not control:
@@ -90,10 +90,13 @@ authenticate only at `/admin/login`. Customer users authenticate only at
 `/login`, receive a workspace membership context, and cannot use the product
 admin session or endpoints.
 
-Workspace owners and workspace admins use Workspace settings to add, remove,
-and role-change users inside their current workspace. They cannot create product
-admins, allocate TFNs, alter room capacity policy, or see another workspace.
-Workspace operators can run live room controls, while viewers are read-only.
+Workspace owners and workspace admins use the same Workspace settings page to
+add, remove, and role-change users inside their current workspace. Workspace
+users can see the product-assigned TFN and participant limit in room cards and
+Room settings, but those controls are read-only and their API role cannot assign
+TFNs or alter room concurrency. Product administrators see the same controls as
+editable after selecting a workspace. Workspace operators can run live room
+controls, while viewers are read-only.
 
 ### Room isolation
 
@@ -375,12 +378,14 @@ The API owns authenticated customer operations:
 - speaker request queue, grant, and withdraw;
 - internal DTMF and sidecar event ingestion.
 
-The platform-admin surface is separate from those customer operations:
+The product-admin identity boundary is separate, but its post-login UI shares
+the customer workspace surface:
 
 - `POST /api/v1/auth/login` creates only a customer workspace session;
 - `POST /api/v1/auth/admin/login` creates only a product-admin session;
 - `/api/v1/admin/*` is protected by the separate `phonarch_admin_session` cookie;
-- admin endpoints manage a selected workspace's rooms, TFNs, users, and membership;
+- the shared `/api/v1/bridges*` routes accept a product-admin session only with an explicit active `workspace_id` scope;
+- product-admin policy endpoints manage the selected workspace's TFNs and room limits;
 - `/api/v1/workspace/members*` lets workspace owners/admins manage users in their current workspace;
 - no customer-facing endpoint creates a product account or bypasses workspace membership.
 
@@ -391,7 +396,7 @@ The API binds to localhost by default. If it is exposed beyond the host, configu
 The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icons. It contains:
 
 - workspace landing page with room cards and room deletion confirmation;
-- separate `/admin/login` and `/admin` product console for owners/managers, with explicit workspace scoping, room, TFN, user, and membership management;
+- separate `/admin/login` product identity boundary with the shared workspace/room UI at `/admin`; the product-admin session adds cross-workspace selection and editable TFN/concurrency policy;
 - workspace Settings user management for OWNER/ADMIN roles, scoped to the current workspace;
 - fixed host editor and editable participant roster;
 - direct SIP dialer plus live floating ad-hoc dialer;

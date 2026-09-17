@@ -150,19 +150,31 @@ func (a *api) currentAdminSession(r *http.Request) (session, bool) {
 	return s, ok && time.Now().Before(s.expiresAt)
 }
 func (a *api) auth(r *http.Request) bool {
-	_, ok := a.currentSession(r)
+	if _, ok := a.currentSession(r); ok {
+		return true
+	}
+	_, ok := a.currentAdminSession(r)
 	return ok
 }
 
 func (a *api) workspaceID(r *http.Request) (string, bool) {
-	s, ok := a.currentSession(r)
-	if !ok || s.workspaceID == "" {
-		return "", false
+	if s, ok := a.currentSession(r); ok && s.workspaceID != "" {
+		// Customer sessions select exactly one workspace at login. The workspace
+		// is never accepted from a request parameter for customer sessions.
+		return s.workspaceID, true
 	}
-	// The workspace is selected by the authenticated session. A future
-	// workspace switch must re-issue the session after checking membership;
-	// accepting an arbitrary header here would break tenant isolation.
-	return s.workspaceID, true
+	if _, ok := a.currentAdminSession(r); ok {
+		workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+		if workspaceID == "" {
+			return "", false
+		}
+		var status string
+		if err := a.db.QueryRowContext(r.Context(), `SELECT status FROM workspaces WHERE id=$1`, workspaceID).Scan(&status); err != nil || status != "ACTIVE" {
+			return "", false
+		}
+		return workspaceID, true
+	}
+	return "", false
 }
 
 func (a *api) requireWorkspace(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -193,6 +205,17 @@ func (a *api) requirePlatformAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *api) requireWorkspaceRole(w http.ResponseWriter, r *http.Request, allowed ...string) (string, string, bool) {
+	if _, admin := a.currentAdminSession(r); admin {
+		workspaceID, ok := a.workspaceID(r)
+		if !ok {
+			a.json(w, http.StatusUnauthorized, map[string]string{"error": "workspace context unavailable"})
+			return "", "", false
+		}
+		// Product administrators are authorized across every selected active
+		// workspace. The product-admin cookie is never usable without the
+		// explicit workspace_id scope above.
+		return workspaceID, "OWNER", true
+	}
 	s, ok := a.currentSession(r)
 	if !ok || s.workspaceID == "" {
 		a.json(w, http.StatusUnauthorized, map[string]string{"error": "workspace context unavailable"})
@@ -214,6 +237,12 @@ func (a *api) requireWorkspaceRole(w http.ResponseWriter, r *http.Request, allow
 }
 
 func (a *api) workspaceRole(r *http.Request) (string, bool) {
+	if _, admin := a.currentAdminSession(r); admin {
+		if _, ok := a.workspaceID(r); ok {
+			return "OWNER", true
+		}
+		return "", false
+	}
 	s, ok := a.currentSession(r)
 	if !ok || s.workspaceID == "" {
 		return "", false
