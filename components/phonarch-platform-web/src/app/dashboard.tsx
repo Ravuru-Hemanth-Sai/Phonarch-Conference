@@ -39,6 +39,7 @@ import {
   Trash2,
   Upload,
   Users,
+  UserPlus,
   Volume2,
   X,
 } from "lucide-react";
@@ -358,31 +359,68 @@ export function Dashboard({ adminMode = false }: { adminMode?: boolean }) {
     <main className="main-content">
       <TopBar view={view} room={selectedRoom} userName={identity?.display_name || identity?.username || "Operator"} workspaceRole={identity?.workspace_role || "Workspace user"} onNavigate={navigate} onLogout={() => void logout()} onRefresh={refresh} adminMode={adminMode} workspace={adminMode ? selectedWorkspace : identity?.workspace} workspaces={adminWorkspaces} selectedWorkspaceID={selectedWorkspaceID} onWorkspaceChange={adminMode ? (workspaceID) => { setSelectedWorkspaceID(workspaceID); setRooms([]); setRoomStates({}); setSelectedRoomId(""); setView("rooms"); } : undefined} />
       {notice && <div className={`notice ${notice.tone}`}><span className="notice-icon">{notice.tone === "success" ? <Check size={14} /> : <AlertCircle size={14} />}</span><span>{notice.message}</span><button type="button" onClick={() => setNotice(null)}><X size={14} /></button></div>}
-      {view === "rooms" && <RoomsPage summaries={roomSummaries} onOpenRoom={openRoom} onCreateRoom={() => setCreateOpen(true)} onDeleteRoom={(room) => { setDeleteError(""); setDeleteTarget(room); }} />}
+      {view === "rooms" && <RoomsPage summaries={roomSummaries} onOpenRoom={openRoom} onCreateRoom={() => setCreateOpen(true)} onDeleteRoom={(room) => { setDeleteError(""); setDeleteTarget(room); }} adminMode={adminMode} workspaceID={selectedWorkspaceID} onRefresh={() => void loadRooms()} />}
       {view === "room" && selectedRoom && <RoomPage room={selectedRoom} state={selectedState || { bridge_id: selectedRoom.id, participants: [] }} tab={roomTab} onTab={setRoomTab} onRefresh={() => void loadRoom(selectedRoom.id)} notify={notify} adminMode={adminMode} />}
       {view === "dialer" && <DialerPage rooms={rooms} selectedRoomId={selectedRoomId} onRoomChange={setSelectedRoomId} onOpenRoom={(id) => openRoom(id, "dialer")} notify={notify} />}
       {view === "bulk" && <BulkPage rooms={rooms} selectedRoomId={selectedRoomId} onRoomChange={setSelectedRoomId} onOpenRoom={(id) => openRoom(id, "bulk")} notify={notify} />}
       {view === "activity" && <ActivityPage data={allParticipants} onOpenRoom={openRoom} />}
-      {view === "settings" && <SettingsPage identity={identity} />}
+      {view === "settings" && <SettingsPage identity={identity} adminMode={adminMode} workspaces={adminWorkspaces} selectedWorkspaceID={selectedWorkspaceID} onWorkspaceCreated={() => void loadAdminWorkspaces()} />}
     </main>
     {createOpen && <CreateRoomModal onClose={() => setCreateOpen(false)} onCreate={(name) => void createRoom(name)} />}
     {deleteTarget && <DeleteRoomModal room={deleteTarget} error={deleteError} busy={deleteBusy} onClose={() => { if (!deleteBusy) { setDeleteTarget(null); setDeleteError(""); } }} onConfirm={() => void deleteRoom(deleteTarget.id, deleteTarget.name)} />}
   </div>;
 }
 
-function RoomsPage({ summaries, onOpenRoom, onCreateRoom, onDeleteRoom }: { summaries: Array<{ room: Bridge; participants: Participant[]; connected: Participant[]; live: Participant[] }>; onOpenRoom: (id: string) => void; onCreateRoom: () => void; onDeleteRoom: (room: Bridge) => void }) {
+type AdminTFN = { id: string; number: string; label: string; room_id: string };
+
+function RoomsPage({ summaries, onOpenRoom, onCreateRoom, onDeleteRoom, adminMode = false, workspaceID = "", onRefresh }: { summaries: Array<{ room: Bridge; participants: Participant[]; connected: Participant[]; live: Participant[] }>; onOpenRoom: (id: string) => void; onCreateRoom: () => void; onDeleteRoom: (room: Bridge) => void; adminMode?: boolean; workspaceID?: string; onRefresh?: () => void }) {
   const [query, setQuery] = useState("");
+  const [tfns, setTFNs] = useState<AdminTFN[]>([]);
+  const [tfnNumber, setTFNNumber] = useState("");
+  const [tfnLabel, setTFNLabel] = useState("");
+  const [tfnBusy, setTFNBusy] = useState(false);
+  const [allocationMessage, setAllocationMessage] = useState("");
   const filtered = summaries.filter(({ room }) => room.name.toLowerCase().includes(query.toLowerCase()));
+  useEffect(() => {
+    if (!adminMode || !workspaceID) return;
+    void request<AdminTFN[]>("/api/v1/admin/tfns").then(setTFNs).catch(() => setTFNs([]));
+  }, [adminMode, workspaceID]);
+  async function addTFN(event: FormEvent) {
+    event.preventDefault(); setTFNBusy(true); setAllocationMessage("");
+    try {
+      await request("/api/v1/admin/tfns", { method: "POST", body: JSON.stringify({ workspace_id: workspaceID, number: tfnNumber, label: tfnLabel }) });
+      const next = await request<AdminTFN[]>("/api/v1/admin/tfns");
+      setTFNs(next); setTFNNumber(""); setTFNLabel(""); setAllocationMessage("TFN added to this workspace and is ready to assign to a room.");
+    } catch (error) { setAllocationMessage(error instanceof Error ? error.message : "TFN could not be added"); } finally { setTFNBusy(false); }
+  }
   return <div className="page-enter">
     <section className="workspace-health-hub"><div className="workspace-health-copy"><div className="eyebrow">Workspace hub</div><h1>Conference room orchestration</h1><p>Create calm rooms for live conferences. Every room keeps people, calls, and operator controls together.</p><div className="workspace-health-actions"><button type="button" className="button primary" onClick={onCreateRoom}><Plus size={15} /> New conference room</button><span className="hero-note"><ShieldCheck size={14} /> Workspace-scoped</span></div></div><div className="workspace-philosophy-card"><span className="workspace-philosophy-quote">“</span><span className="eyebrow">Our philosophy</span><blockquote>Conversations work best when the room feels calm, observable, and ready.</blockquote></div></section>
+    {adminMode && <section className="panel admin-allocation-panel"><div><div className="eyebrow">Product allocation</div><h2>Workspace telephony policy</h2><p className="subtle">Add an active TFN to this workspace, then assign it to a room and set that room’s caller limit.</p></div><form className="admin-allocation-form" onSubmit={(event) => void addTFN(event)}><input className="field-control" value={tfnNumber} onChange={(event) => setTFNNumber(event.target.value)} placeholder="+919876543210" inputMode="tel" required /><input className="field-control" value={tfnLabel} onChange={(event) => setTFNLabel(event.target.value)} placeholder="TFN label" /><button className="button primary" disabled={tfnBusy}><Plus size={14} /> {tfnBusy ? "Adding…" : "Add TFN"}</button></form>{allocationMessage && <small className="admin-allocation-message">{allocationMessage}</small>}{tfns.length > 0 && <div className="admin-allocation-list">{tfns.map((tfn) => <span key={tfn.id} className="admin-allocation-chip"><Phone size={11} />{tfn.number}<small>{tfn.room_id ? "Assigned" : "Available"}</small></span>)}</div>}</section>}
     <div className="section-heading"><div><div className="eyebrow">Room directory</div><h2>Conference rooms</h2><p className="subtle">Open a room to dial participants, run bulk outreach, and control active callers.</p></div><label className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search rooms" aria-label="Search rooms" /></label></div>
-    {filtered.length ? <div className="room-grid">{filtered.map(({ room, live }) => <RoomCard key={room.id} room={room} live={live} onOpen={() => onOpenRoom(room.id)} onDelete={() => onDeleteRoom(room)} />)}</div> : <div className="panel empty-state"><div className="empty-state-icon"><Building2 size={21} /></div><h3>{summaries.length ? "No rooms match this search" : "No conference rooms yet"}</h3><p>{summaries.length ? "Try another room name." : "Create a room when you are ready to organize participants. Nothing is created automatically."}</p>{!summaries.length && <button type="button" className="button primary" onClick={onCreateRoom}><Plus size={15} /> Create a conference room</button>}</div>}
+    {filtered.length ? <div className="room-grid">{filtered.map(({ room, live }) => <RoomCard key={room.id} room={room} live={live} onOpen={() => onOpenRoom(room.id)} onDelete={() => onDeleteRoom(room)} adminMode={adminMode} tfns={tfns} onRefresh={onRefresh} />)}</div> : <div className="panel empty-state"><div className="empty-state-icon"><Building2 size={21} /></div><h3>{summaries.length ? "No rooms match this search" : "No conference rooms yet"}</h3><p>{summaries.length ? "Try another room name." : "Create a room when you are ready to organize participants. Nothing is created automatically."}</p>{!summaries.length && <button type="button" className="button primary" onClick={onCreateRoom}><Plus size={15} /> Create a conference room</button>}</div>}
   </div>;
 }
 
-function RoomCard({ room, live, onOpen, onDelete }: { room: Bridge; live: Participant[]; onOpen: () => void; onDelete: () => void }) {
+function RoomCard({ room, live, onOpen, onDelete, adminMode = false, tfns = [], onRefresh }: { room: Bridge; live: Participant[]; onOpen: () => void; onDelete: () => void; adminMode?: boolean; tfns?: AdminTFN[]; onRefresh?: () => void }) {
   const hasLive = live.length > 0;
-  return <article className="room-card panel" onClick={onOpen} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onOpen(); }} role="button" tabIndex={0}><div className="room-card-top"><span className="room-mark"><Building2 size={18} /></span><StatusPill label={hasLive ? "Live" : "Ready"} state={hasLive ? "IN_BRIDGE" : undefined} /><button type="button" className="room-delete" title={`Delete ${room.name}`} aria-label={`Delete ${room.name}`} onClick={(event) => { event.stopPropagation(); onDelete(); }}><Trash2 size={15} /></button></div><div className="room-card-body"><div className="room-card-title"><h3>{room.name}</h3><ArrowUpRight size={16} /></div><p>{hasLive ? "Live conference in progress" : "Ready when you are"}</p></div><div className="room-card-policy"><span><Phone size={11} />{room.tfn_number || "No TFN assigned"}</span><span><Users size={11} />{room.participant_limit ? `${room.participant_limit} max callers` : "Limit not set"}</span></div><div className="room-card-foot"><span><span className={`room-live-indicator ${hasLive ? "active" : ""}`} />{hasLive ? `${live.length} participant${live.length === 1 ? "" : "s"} live` : "No active conference"}</span><span className="room-open">Open <ArrowRight size={13} /></span></div></article>;
+  return <article className="room-card panel" onClick={onOpen} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onOpen(); }} role="button" tabIndex={0}><div className="room-card-top"><span className="room-mark"><Building2 size={18} /></span><StatusPill label={hasLive ? "Live" : "Ready"} state={hasLive ? "IN_BRIDGE" : undefined} /><button type="button" className="room-delete" title={`Delete ${room.name}`} aria-label={`Delete ${room.name}`} onClick={(event) => { event.stopPropagation(); onDelete(); }}><Trash2 size={15} /></button></div><div className="room-card-body"><div className="room-card-title"><h3>{room.name}</h3><ArrowUpRight size={16} /></div><p>{hasLive ? "Live conference in progress" : "Ready when you are"}</p></div><div className="room-card-policy"><span><Phone size={11} />{room.tfn_number || "No TFN assigned"}</span><span><Users size={11} />{room.participant_limit ? `${room.participant_limit} max callers` : "Limit not set"}</span></div>{adminMode && <AdminRoomCardPolicy room={room} tfns={tfns} onSaved={onRefresh} />}<div className="room-card-foot"><span><span className={`room-live-indicator ${hasLive ? "active" : ""}`} />{hasLive ? `${live.length} participant${live.length === 1 ? "" : "s"} live` : "No active conference"}</span><span className="room-open">Open <ArrowRight size={13} /></span></div></article>;
+}
+
+function AdminRoomCardPolicy({ room, tfns, onSaved }: { room: Bridge; tfns: AdminTFN[]; onSaved?: () => void }) {
+  const [participantLimit, setParticipantLimit] = useState(String(room.participant_limit || 500));
+  const [tfnID, setTFNID] = useState(room.tfn_id || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const locked = room.room_state === "RUNNING" || room.room_state === "STARTING";
+  useEffect(() => { setParticipantLimit(String(room.participant_limit || 500)); setTFNID(room.tfn_id || ""); }, [room.id, room.participant_limit, room.tfn_id]);
+  async function savePolicy(event: FormEvent) {
+    event.preventDefault(); event.stopPropagation(); setBusy(true); setError("");
+    try {
+      await request(`/api/v1/admin/rooms/${room.id}`, { method: "PUT", body: JSON.stringify({ name: room.name, participant_limit: Number(participantLimit), tfn_id: tfnID || null }) });
+      onSaved?.();
+    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : "Room allocation could not be saved"); } finally { setBusy(false); }
+  }
+  return <form className="room-card-admin-controls" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} onSubmit={(event) => void savePolicy(event)}><label className="field-label">Room TFN<select className="field-control" value={tfnID} onChange={(event) => setTFNID(event.target.value)} disabled={busy || locked}><option value="">No TFN assigned</option>{tfns.map((tfn) => <option key={tfn.id} value={tfn.id}>{tfn.number}{tfn.room_id && tfn.room_id !== room.id ? " · assigned" : ""}</option>)}</select></label><label className="field-label">Concurrency<input className="field-control" type="number" min="1" value={participantLimit} onChange={(event) => setParticipantLimit(event.target.value)} disabled={busy || locked} /></label><button type="submit" className="button ghost compact-button" disabled={busy || locked}>{locked ? "Locked" : <><Save size={13} /> Save</>}</button>{error && <small className="room-card-admin-error">{error}</small>}</form>;
 }
 
 function RoomSidebar({ room, tab, connectedCount, liveCount, collapsed, onToggle, onTab, onBack }: { room: Bridge; tab: RoomTab; connectedCount: number; liveCount: number; collapsed: boolean; onToggle: () => void; onTab: (tab: RoomTab) => void; onBack: () => void }) {
@@ -657,7 +695,7 @@ function LegacySettingsPage() {
 
 type WorkspaceMember = { operator_id: string; username: string; display_name: string; status: string; role: string };
 
-function SettingsPage({ identity }: { identity: AuthMe | null }) {
+function SettingsPage({ identity, adminMode = false, workspaces = [], selectedWorkspaceID = "", onWorkspaceCreated }: { identity: AuthMe | null; adminMode?: boolean; workspaces?: WorkspaceOption[]; selectedWorkspaceID?: string; onWorkspaceCreated?: () => void }) {
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [displayName, setDisplayName] = useState("");
   const [username, setUsername] = useState("");
@@ -672,6 +710,10 @@ function SettingsPage({ identity }: { identity: AuthMe | null }) {
   }
 
   useEffect(() => { void loadMembers(); }, []);
+
+  if (adminMode) {
+    return <ProductAdminSettings identity={identity} workspaces={workspaces} selectedWorkspaceID={selectedWorkspaceID} onWorkspaceCreated={onWorkspaceCreated} />;
+  }
 
   async function addUser(event: FormEvent) {
     event.preventDefault(); setBusy(true); setMessage("");
@@ -693,6 +735,71 @@ function SettingsPage({ identity }: { identity: AuthMe | null }) {
   }
 
   return <div className="page-enter"><PageHeader eyebrow="Workspace · Administration" title="Workspace settings" description="Manage users and defaults inside this workspace. Product allocation, TFNs, and cross-workspace policy remain isolated in the product admin console." actions={<span className="scope-badge"><ShieldCheck size={14} /> {identity?.workspace_role || "Workspace-scoped"}</span>} /><div className="settings-grid"><section className="panel settings-main"><div className="settings-intro"><span className="settings-icon"><Users size={17} /></span><div><div className="eyebrow">Workspace access</div><h2>User management</h2><p className="subtle">Workspace owners and admins can provision customer users. Product administrators manage cross-workspace access separately.</p></div><span className="scope-badge"><ShieldCheck size={14} /> {canManageUsers ? "Manage access" : "Read only"}</span></div>{canManageUsers && <form className="workspace-user-form" onSubmit={(event) => void addUser(event)}><input className="field-control" value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Display name" required /><input className="field-control" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Username" required /><input className="field-control" type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Temporary password" required /><select className="field-control" value={role} onChange={(event) => setRole(event.target.value)}><option value="OPERATOR">Operator</option><option value="ADMIN">Workspace admin</option><option value="VIEWER">Viewer</option></select><button className="button primary" disabled={busy}><Plus size={14} /> Add user</button></form>}{message && <div className="settings-inline-message">{message}</div>}<div className="workspace-member-list">{members.map((member) => <div className="workspace-member-row" key={member.operator_id}><span className="user-avatar">{initials(member.display_name || member.username)}</span><span><strong>{member.display_name || member.username}</strong><small>{member.username} · {member.status}</small></span>{member.role === "OWNER" ? <span className="role-pill">OWNER</span> : canManageUsers ? <><select className="field-control compact-select" value={member.role} onChange={(event) => void updateRole(member, event.target.value)} disabled={busy}><option value="ADMIN">ADMIN</option><option value="OPERATOR">OPERATOR</option><option value="VIEWER">VIEWER</option></select><button type="button" className="button ghost compact-button" onClick={() => void removeUser(member)} disabled={busy}>Remove</button></> : <span className="role-pill">{member.role}</span>}</div>)}</div></section><section className="panel settings-main"><div className="settings-section-title"><div><div className="eyebrow">Workspace defaults</div><h2>Conference experience</h2><p className="subtle">Customer-facing settings shared by this workspace. Room-specific host, roster, and operations remain inside each room.</p></div><Building2 size={18} /></div><div className="policy-list"><PolicyRow icon={Users} title="Room membership" value="Workspace members" detail="Only authorized users can operate rooms" /><PolicyRow icon={Mic} title="Participant controls" value="Enabled" detail="Mute, unmute, volume, and remove callers" /><PolicyRow icon={ShieldCheck} title="Access boundary" value="Private" detail="Rooms and participants stay within this workspace" /></div></section><section className="panel settings-main settings-note-card"><div className="settings-note-icon"><LifeBuoy size={17} /></div><div><div className="eyebrow">Access boundary</div><h3>Product administration is isolated.</h3><p className="subtle">Product owners use the separate Admin Console to select any workspace, allocate TFNs, and set room policy. Workspace admins only manage users in this workspace.</p></div></section></div></div>;
+}
+
+function ProductAdminSettings({ identity, workspaces, selectedWorkspaceID, onWorkspaceCreated }: { identity: AuthMe | null; workspaces: WorkspaceOption[]; selectedWorkspaceID: string; onWorkspaceCreated?: () => void }) {
+  const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceID);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [workspaceSlug, setWorkspaceSlug] = useState("");
+  const [workspaceLimit, setWorkspaceLimit] = useState("500");
+  const [policyName, setPolicyName] = useState(selectedWorkspace?.name || "");
+  const [policyLimit, setPolicyLimit] = useState(String(selectedWorkspace?.max_participants || 500));
+  const [policyStatus, setPolicyStatus] = useState(selectedWorkspace?.status || "ACTIVE");
+  const [displayName, setDisplayName] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("OPERATOR");
+  const [members, setMembers] = useState<WorkspaceMember[]>([]);
+  const [lastAccess, setLastAccess] = useState<{ username: string; password: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setPolicyName(selectedWorkspace?.name || "");
+    setPolicyLimit(String(selectedWorkspace?.max_participants || 500));
+    setPolicyStatus(selectedWorkspace?.status || "ACTIVE");
+  }, [selectedWorkspace?.id, selectedWorkspace?.max_participants, selectedWorkspace?.name, selectedWorkspace?.status]);
+  async function loadMembers() {
+    if (!selectedWorkspaceID) return;
+    try { setMembers(await request<WorkspaceMember[]>("/api/v1/workspace/members")); } catch (error) { setMessage(error instanceof Error ? error.message : "Workspace members could not be loaded"); }
+  }
+  useEffect(() => { void loadMembers(); }, [selectedWorkspaceID]);
+  async function createWorkspace(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setMessage("");
+    try {
+      await request("/api/v1/admin/workspaces", { method: "POST", body: JSON.stringify({ name: workspaceName, slug: workspaceSlug, max_participants: Number(workspaceLimit) }) });
+      setWorkspaceName(""); setWorkspaceSlug(""); setWorkspaceLimit("500"); setMessage("Workspace created. Select it from the workspace switcher to continue provisioning."); onWorkspaceCreated?.();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Workspace could not be created"); } finally { setBusy(false); }
+  }
+  async function saveWorkspace(event: FormEvent) {
+    event.preventDefault(); if (!selectedWorkspace) return; setBusy(true); setMessage("");
+    try {
+      await request(`/api/v1/admin/workspaces/${selectedWorkspace.id}`, { method: "PUT", body: JSON.stringify({ name: policyName, status: policyStatus, max_participants: Number(policyLimit) }) });
+      setMessage("Workspace policy saved"); onWorkspaceCreated?.();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Workspace policy could not be saved"); } finally { setBusy(false); }
+  }
+  async function createUser(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setMessage("");
+    try {
+      await request("/api/v1/workspace/members", { method: "POST", body: JSON.stringify({ display_name: displayName, username, password, role }) });
+      setLastAccess({ username, password }); setDisplayName(""); setUsername(""); setPassword(""); setRole("OPERATOR"); setMessage("Workspace user created and access assigned"); await loadMembers();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Workspace user could not be created"); } finally { setBusy(false); }
+  }
+  async function updateMember(member: WorkspaceMember, nextRole: string) {
+    setBusy(true); setMessage("");
+    try { await request(`/api/v1/workspace/members/${member.operator_id}`, { method: "PUT", body: JSON.stringify({ role: nextRole }) }); setMessage("Workspace role updated"); await loadMembers(); } catch (error) { setMessage(error instanceof Error ? error.message : "Role could not be updated"); } finally { setBusy(false); }
+  }
+  async function removeMember(member: WorkspaceMember) {
+    if (member.role === "OWNER" || !window.confirm(`Remove ${member.display_name || member.username} from this workspace?`)) return;
+    setBusy(true); setMessage("");
+    try { await request(`/api/v1/workspace/members/${member.operator_id}`, { method: "DELETE" }); setMessage("Workspace access removed"); await loadMembers(); } catch (error) { setMessage(error instanceof Error ? error.message : "Workspace access could not be removed"); } finally { setBusy(false); }
+  }
+  async function copyAccess() {
+    if (!lastAccess) return;
+    await navigator.clipboard?.writeText(`PhonArch workspace access\nUsername: ${lastAccess.username}\nTemporary password: ${lastAccess.password}`);
+    setMessage("Access details copied");
+  }
+  return <div className="page-enter"><PageHeader eyebrow="Product administration" title="Workspace control center" description="Create isolated customer workspaces, provision their first users, and govern the policies that workspace teams can only view." actions={<span className="scope-badge"><ShieldCheck size={14} /> Product admin · {identity?.display_name || "Owner"}</span>} /><div className="admin-settings-grid"><section className="panel settings-main admin-settings-card"><div className="settings-section-title"><div><div className="eyebrow">Tenant provisioning</div><h2>Create workspace</h2><p className="subtle">A workspace is the customer boundary for rooms, users, TFNs, and call history.</p></div><Building2 size={18} /></div><form className="admin-create-workspace-form" onSubmit={(event) => void createWorkspace(event)}><label className="field-label">Workspace name<input className="field-control" value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="e.g. North region operations" required /></label><label className="field-label">Workspace slug<input className="field-control" value={workspaceSlug} onChange={(event) => setWorkspaceSlug(event.target.value)} placeholder="north-region" /></label><label className="field-label">Default room limit<input className="field-control" type="number" min="1" value={workspaceLimit} onChange={(event) => setWorkspaceLimit(event.target.value)} /></label><button className="button primary" disabled={busy}><Plus size={14} /> Create workspace</button></form></section><section className="panel settings-main admin-settings-card"><div className="settings-section-title"><div><div className="eyebrow">Selected workspace policy</div><h2>{selectedWorkspace?.name || "Select a workspace"}</h2><p className="subtle">The default is used for new rooms. Product admins set individual room limits from the workspace landing page.</p></div><ShieldCheck size={18} /></div>{selectedWorkspace ? <form className="admin-workspace-policy-form" onSubmit={(event) => void saveWorkspace(event)}><label className="field-label">Workspace name<input className="field-control" value={policyName} onChange={(event) => setPolicyName(event.target.value)} /></label><label className="field-label">Default room limit<input className="field-control" type="number" min="1" value={policyLimit} onChange={(event) => setPolicyLimit(event.target.value)} /></label><label className="field-label">Status<select className="field-control" value={policyStatus} onChange={(event) => setPolicyStatus(event.target.value)}><option value="ACTIVE">Active</option><option value="SUSPENDED">Suspended</option></select></label><button className="button primary" disabled={busy}><Save size={14} /> Save policy</button></form> : <div className="session-empty"><Building2 size={17} /><span><strong>No workspace selected</strong><small>Use the workspace switcher in the top bar.</small></span></div>}</section><section className="panel settings-main admin-settings-card admin-user-provisioning"><div className="settings-section-title"><div><div className="eyebrow">Customer access</div><h2>Provision workspace users</h2><p className="subtle">Create a customer account directly inside the selected workspace. The customer can later manage users according to their assigned role.</p></div><Users size={18} /></div><form className="admin-provision-user-form" onSubmit={(event) => void createUser(event)}><input className="field-control" value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Display name" required /><input className="field-control" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Username" required /><input className="field-control" type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Temporary password" required /><select className="field-control" value={role} onChange={(event) => setRole(event.target.value)}><option value="ADMIN">Workspace admin</option><option value="OPERATOR">Workspace operator</option><option value="VIEWER">Read-only viewer</option></select><button className="button primary" disabled={busy || !selectedWorkspaceID}><UserPlus size={14} /> Create user</button></form>{lastAccess && <div className="admin-credential-card"><span className="mini-icon"><Check size={14} /></span><span><strong>Share these one-time access details</strong><small>{lastAccess.username} · temporary password ready to share with the customer</small></span><button type="button" className="button ghost compact-button" onClick={() => void copyAccess()}>Copy details</button></div>}{message && <div className="settings-inline-message">{message}</div>}<div className="workspace-member-list">{members.map((member) => <div className="workspace-member-row" key={member.operator_id}><span className="user-avatar">{initials(member.display_name || member.username)}</span><span><strong>{member.display_name || member.username}</strong><small>{member.username} · {member.status}</small></span>{member.role === "OWNER" ? <span className="role-pill">OWNER</span> : <><select className="field-control compact-select" value={member.role} onChange={(event) => void updateMember(member, event.target.value)} disabled={busy}><option value="ADMIN">ADMIN</option><option value="OPERATOR">OPERATOR</option><option value="VIEWER">VIEWER</option></select><button type="button" className="button ghost compact-button" onClick={() => void removeMember(member)} disabled={busy}>Remove</button></>}</div>)}</div></section><section className="panel settings-main admin-settings-card"><div className="settings-section-title"><div><div className="eyebrow">Governance map</div><h2>Who controls what</h2><p className="subtle">The same workspace experience is capability-aware, so customers see the policy without being able to change it.</p></div><ShieldCheck size={18} /></div><div className="policy-list"><PolicyRow icon={Building2} title="Product admin" value="All workspaces" detail="Create tenants, users, TFNs, and room limits" /><PolicyRow icon={Users} title="Workspace admin" value="One workspace" detail="Manage workspace users and roles" /><PolicyRow icon={Mic} title="Operator" value="Room operations" detail="Start rooms and control active callers" /></div></section></div></div>;
 }
 
 function PolicyRow({ icon: Icon, title, value, detail }: { icon: LucideIcon; title: string; value: string; detail: string }) {

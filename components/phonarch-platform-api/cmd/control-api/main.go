@@ -1972,7 +1972,9 @@ func (a *api) adminUpdateRoom(w http.ResponseWriter, r *http.Request, roomID str
 			}
 		}
 	}
-	_, err := a.db.ExecContext(r.Context(), `UPDATE bridges SET name=$1,participant_limit=$2,tfn_id=NULLIF($3,''),updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.ParticipantLimit, tfnID, roomID)
+	// tfn_id is UUID. Keep the empty selection as SQL NULL instead of allowing
+	// PostgreSQL to attempt an empty-string UUID cast.
+	_, err := a.db.ExecContext(r.Context(), `UPDATE bridges SET name=$1,participant_limit=$2,tfn_id=CASE WHEN $3='' THEN NULL ELSE $3::uuid END,updated_at=now() WHERE id=$4`, strings.TrimSpace(in.Name), in.ParticipantLimit, tfnID, roomID)
 	if err != nil {
 		a.json(w, http.StatusConflict, map[string]string{"error": "room update failed; TFN may already be assigned to another room"})
 		return
