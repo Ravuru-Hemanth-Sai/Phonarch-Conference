@@ -526,6 +526,9 @@ function AdminRoomPolicy({ room, state, onRefresh, notify, adminMode = false }: 
   const [tfnID, setTFNID] = useState(state.tfn?.id || room.tfn_id || "");
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [newTFN, setNewTFN] = useState("");
+  const [newTFNLabel, setNewTFNLabel] = useState("");
+  const [addingTFN, setAddingTFN] = useState(false);
   const locked = state.room_state === "RUNNING" || state.room_state === "STARTING";
   useEffect(() => {
     setParticipantLimit(String(state.participant_limit || room.participant_limit || 500));
@@ -542,8 +545,19 @@ function AdminRoomPolicy({ room, state, onRefresh, notify, adminMode = false }: 
       notify("Room TFN and participant limit saved"); onRefresh();
     } catch (error) { notify(error instanceof Error ? error.message : "Room policy could not be saved", "error"); } finally { setBusy(false); }
   }
+  async function registerTFN() {
+    if (!state.workspace_id || !newTFN.trim()) return;
+    setAddingTFN(true);
+    try {
+      const created = await request<{ id: string; number: string; label: string; room_id: string }>("/api/v1/admin/tfns", { method: "POST", body: JSON.stringify({ workspace_id: state.workspace_id, number: newTFN.trim(), label: newTFNLabel.trim() }) });
+      setTFNs((current) => [created, ...current]);
+      setTFNID(created.id);
+      setNewTFN(""); setNewTFNLabel("");
+      notify("TFN / DID registered; save the room allocation to assign it");
+    } catch (error) { notify(error instanceof Error ? error.message : "TFN / DID could not be registered", "error"); } finally { setAddingTFN(false); }
+  }
   const assignedTFN = tfns.find((tfn) => tfn.id === tfnID)?.number || state.tfn?.number || room.tfn_number || "Not assigned";
-  return <section className="room-setting-card panel admin-room-policy-panel"><div className="room-setting-card-icon"><ShieldCheck size={17} /></div><div className="room-setting-card-copy"><div className="eyebrow">Room allocation</div><h3>{adminMode ? "TFN / DID and capacity" : "Product allocation"}</h3><p>{adminMode ? "Assign the caller identity and concurrency limit used by this room." : "The product administrator controls this room’s caller identity and concurrency limit."}</p><div className="room-policy-summary"><span><strong>{assignedTFN}</strong><small>Assigned TFN / DID</small></span><span><strong>{participantLimit}</strong><small>Max callers</small></span></div></div>{adminMode ? <button type="button" className="button ghost compact-button" onClick={() => setEditing((value) => !value)} disabled={locked}><Edit3 size={14} /> {locked ? "Locked live" : editing ? "Close" : "Edit card"}</button> : <span className="ownership-label"><LockKeyhole size={12} /> View only</span>}{editing && <form className="admin-room-policy-form" onSubmit={(event) => void savePolicy(event)}><label className="field-label">Assigned TFN / DID<select className="field-control" value={tfnID} onChange={(event) => setTFNID(event.target.value)} disabled={busy || locked}><option value="">No TFN assigned</option>{tfns.map((tfn) => <option key={tfn.id} value={tfn.id}>{tfn.number}{tfn.room_id && tfn.room_id !== room.id ? " · assigned" : ""}</option>)}</select></label><label className="field-label">Concurrency limit<input className="field-control" type="number" min="1" value={participantLimit} onChange={(event) => setParticipantLimit(event.target.value)} disabled={busy || locked} /></label><button className="button primary" disabled={busy || locked}><Save size={14} /> Save allocation</button></form>}</section>;
+  return <section className="room-setting-card panel admin-room-policy-panel"><div className="room-setting-card-icon"><ShieldCheck size={17} /></div><div className="room-setting-card-copy"><div className="eyebrow">Room allocation</div><h3>{adminMode ? "TFN / DID and capacity" : "Product allocation"}</h3><p>{adminMode ? "Assign the caller identity and concurrency limit used by this room." : "The product administrator controls this room’s caller identity and concurrency limit."}</p><div className="room-policy-summary"><span><strong>{assignedTFN}</strong><small>Assigned TFN / DID</small></span><span><strong>{participantLimit}</strong><small>Max callers</small></span></div></div>{adminMode ? <button type="button" className="button ghost compact-button" onClick={() => setEditing((value) => !value)} disabled={locked}><Edit3 size={14} /> {locked ? "Locked live" : editing ? "Close" : "Edit card"}</button> : <span className="ownership-label"><LockKeyhole size={12} /> View only</span>}{editing && <><div className="admin-tfn-register"><div><strong>Register a TFN / DID</strong><small>Use E.164 format, for example +919876543210.</small></div><div className="admin-tfn-register-fields"><input className="field-control" value={newTFN} onChange={(event) => setNewTFN(event.target.value)} placeholder="+919876543210" /><input className="field-control" value={newTFNLabel} onChange={(event) => setNewTFNLabel(event.target.value)} placeholder="Primary India number" /><button type="button" className="button ghost compact-button" onClick={() => void registerTFN()} disabled={addingTFN || !newTFN.trim()}>{addingTFN ? "Adding…" : <><Plus size={14} /> Register</>}</button></div></div><form className="admin-room-policy-form" onSubmit={(event) => void savePolicy(event)}><label className="field-label">Assigned TFN / DID<select className="field-control" value={tfnID} onChange={(event) => setTFNID(event.target.value)} disabled={busy || locked}><option value="">No TFN assigned</option>{tfns.map((tfn) => <option key={tfn.id} value={tfn.id}>{tfn.number}{tfn.room_id && tfn.room_id !== room.id ? " · assigned" : ""}</option>)}</select></label><label className="field-label">Concurrency limit<input className="field-control" type="number" min="1" value={participantLimit} onChange={(event) => setParticipantLimit(event.target.value)} disabled={busy || locked} /></label><button className="button primary" disabled={busy || locked}><Save size={14} /> Save allocation</button></form></>}</section>;
 }
 
 function RoomSettingsForm({ room, state, onRefresh, notify }: RoomSettingsProps) {
