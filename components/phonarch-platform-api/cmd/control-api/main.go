@@ -50,13 +50,13 @@ type batchItem struct {
 	Phone string
 }
 type api struct {
-	db                 *sql.DB
-	sipgoURLs          []string
-	rdb                *redis.Client
-	sessions           map[string]session
-	defaultWorkspaceID string
-	mu                 sync.RWMutex
-	worker             sync.WaitGroup
+	db            *sql.DB
+	sipgoURLs     []string
+	rdb           *redis.Client
+	sessions      map[string]session
+	adminSessions map[string]session
+	mu            sync.RWMutex
+	worker        sync.WaitGroup
 }
 
 type session struct {
@@ -65,6 +65,7 @@ type session struct {
 	operatorID    string
 	username      string
 	displayName   string
+	workspaceRole string
 	platformAdmin bool
 }
 
@@ -138,6 +139,16 @@ func (a *api) currentSession(r *http.Request) (session, bool) {
 	a.mu.RUnlock()
 	return s, ok && time.Now().Before(s.expiresAt)
 }
+func (a *api) currentAdminSession(r *http.Request) (session, bool) {
+	c, err := r.Cookie("phonarch_admin_session")
+	if err != nil {
+		return session{}, false
+	}
+	a.mu.RLock()
+	s, ok := a.adminSessions[c.Value]
+	a.mu.RUnlock()
+	return s, ok && time.Now().Before(s.expiresAt)
+}
 func (a *api) auth(r *http.Request) bool {
 	_, ok := a.currentSession(r)
 	return ok
@@ -173,17 +184,45 @@ func (a *api) require(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *api) requirePlatformAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !a.auth(r) {
+		if _, ok := a.currentAdminSession(r); !ok {
 			a.json(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
-			return
-		}
-		s, _ := a.currentSession(r)
-		if !s.platformAdmin {
-			a.json(w, http.StatusForbidden, map[string]string{"error": "product administrator access required"})
 			return
 		}
 		next(w, r)
 	}
+}
+
+func (a *api) requireWorkspaceRole(w http.ResponseWriter, r *http.Request, allowed ...string) (string, string, bool) {
+	s, ok := a.currentSession(r)
+	if !ok || s.workspaceID == "" {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "workspace context unavailable"})
+		return "", "", false
+	}
+	var role string
+	err := a.db.QueryRowContext(r.Context(), `SELECT wm.role FROM workspace_members wm JOIN workspaces ws ON ws.id=wm.workspace_id WHERE wm.workspace_id=$1 AND wm.operator_id=$2 AND ws.status='ACTIVE' AND wm.role IN ('OWNER','ADMIN','OPERATOR','VIEWER')`, s.workspaceID, s.operatorID).Scan(&role)
+	if err != nil {
+		a.json(w, http.StatusForbidden, map[string]string{"error": "workspace access is no longer active"})
+		return "", "", false
+	}
+	for _, candidate := range allowed {
+		if role == candidate {
+			return s.workspaceID, role, true
+		}
+	}
+	a.json(w, http.StatusForbidden, map[string]string{"error": "workspace role does not allow this action"})
+	return "", role, false
+}
+
+func (a *api) workspaceRole(r *http.Request) (string, bool) {
+	s, ok := a.currentSession(r)
+	if !ok || s.workspaceID == "" {
+		return "", false
+	}
+	var role string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT wm.role FROM workspace_members wm JOIN workspaces ws ON ws.id=wm.workspace_id WHERE wm.workspace_id=$1 AND wm.operator_id=$2 AND ws.status='ACTIVE'`, s.workspaceID, s.operatorID).Scan(&role); err != nil {
+		return "", false
+	}
+	return role, true
 }
 
 func (a *api) login(w http.ResponseWriter, r *http.Request) {
@@ -196,42 +235,48 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.Username = strings.TrimSpace(in.Username)
-	workspaceID := a.defaultWorkspaceID
-	operatorID, displayName := "", in.Username
-	platformAdmin := false
-	bootstrapCredentials := in.Username == env("ADMIN_USERNAME", "admin") && in.Password == env("ADMIN_PASSWORD", "change-me")
-	if bootstrapCredentials {
-		var status, role string
-		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text,COALESCE(display_name,''),COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, in.Username).Scan(&operatorID, &displayName, &role, &status); err != nil || status != "ACTIVE" || (role != "PLATFORM_OWNER" && role != "PLATFORM_ADMIN") {
-			a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
-			return
-		}
-		platformAdmin = true
-	} else {
-		var passwordHash, role, status string
-		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text,password_hash,COALESCE(display_name,''),COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, in.Username).Scan(&operatorID, &passwordHash, &displayName, &role, &status); err != nil || status != "ACTIVE" || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
-			a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
-			return
-		}
-		platformAdmin = role == "PLATFORM_OWNER" || role == "PLATFORM_ADMIN"
-		if workspaceID == "" || !platformAdmin {
-			if err := a.db.QueryRowContext(r.Context(), `SELECT wm.workspace_id::text FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id WHERE wm.operator_id=$1 AND w.status='ACTIVE' ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END LIMIT 1`, operatorID).Scan(&workspaceID); err != nil {
-				a.json(w, http.StatusForbidden, map[string]string{"error": "user has no workspace access"})
-				return
-			}
-		}
+	var operatorID, displayName, passwordHash, platformRole, status string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT id::text,password_hash,COALESCE(display_name,''),COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, in.Username).Scan(&operatorID, &passwordHash, &displayName, &platformRole, &status); err != nil || status != "ACTIVE" || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
 	}
-	if workspaceID == "" {
-		if err := a.db.QueryRowContext(r.Context(), `SELECT id::text FROM workspaces WHERE slug=$1`, env("DEFAULT_WORKSPACE_SLUG", "operations")).Scan(&workspaceID); err != nil {
-			a.json(w, 503, map[string]string{"error": "workspace is not initialized"})
-			return
-		}
+	if platformRole == "PLATFORM_OWNER" || platformRole == "PLATFORM_ADMIN" {
+		a.json(w, http.StatusForbidden, map[string]string{"error": "product administrator accounts must use the product admin login"})
+		return
+	}
+	var workspaceID, workspaceRole string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT wm.workspace_id::text,wm.role FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id WHERE wm.operator_id=$1 AND w.status='ACTIVE' ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END LIMIT 1`, operatorID).Scan(&workspaceID, &workspaceRole); err != nil {
+		a.json(w, http.StatusForbidden, map[string]string{"error": "user has no active workspace access"})
+		return
 	}
 	id := newID()
 	a.mu.Lock()
-	a.sessions[id] = session{expiresAt: time.Now().Add(12 * time.Hour), workspaceID: workspaceID, operatorID: operatorID, username: in.Username, displayName: coalesce(displayName, in.Username), platformAdmin: platformAdmin}
+	a.sessions[id] = session{expiresAt: time.Now().Add(12 * time.Hour), workspaceID: workspaceID, operatorID: operatorID, username: in.Username, displayName: coalesce(displayName, in.Username), workspaceRole: workspaceRole}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "phonarch_session", Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
+	a.json(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *api) adminLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || in.Password == "" {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	var operatorID, displayName, passwordHash, role, status string
+	err := a.db.QueryRowContext(r.Context(), `SELECT id::text,COALESCE(display_name,''),password_hash,COALESCE(platform_role,'WORKSPACE_OPERATOR'),COALESCE(status,'ACTIVE') FROM operators WHERE username=$1`, strings.TrimSpace(in.Username)).Scan(&operatorID, &displayName, &passwordHash, &role, &status)
+	if err != nil || status != "ACTIVE" || (role != "PLATFORM_OWNER" && role != "PLATFORM_ADMIN") || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)) != nil {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "invalid product administrator credentials"})
+		return
+	}
+	id := newID()
+	a.mu.Lock()
+	a.adminSessions[id] = session{expiresAt: time.Now().Add(12 * time.Hour), operatorID: operatorID, username: strings.TrimSpace(in.Username), displayName: coalesce(displayName, in.Username), platformAdmin: true}
+	a.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "phonarch_admin_session", Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
 	a.json(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -248,7 +293,8 @@ func (a *api) me(w http.ResponseWriter, r *http.Request) {
 			workspace = map[string]any{"id": s.workspaceID, "slug": slug, "name": name, "status": status}
 		}
 	}
-	a.json(w, http.StatusOK, map[string]any{"username": s.username, "display_name": s.displayName, "operator_id": s.operatorID, "platform_admin": s.platformAdmin, "workspace": workspace})
+	role, _ := a.workspaceRole(r)
+	a.json(w, http.StatusOK, map[string]any{"username": s.username, "display_name": s.displayName, "operator_id": s.operatorID, "workspace_role": role, "can_manage_users": role == "OWNER" || role == "ADMIN", "workspace": workspace})
 }
 func (a *api) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("phonarch_session"); err == nil {
@@ -257,6 +303,25 @@ func (a *api) logout(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{Name: "phonarch_session", MaxAge: -1, Path: "/"})
+	a.json(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *api) adminMe(w http.ResponseWriter, r *http.Request) {
+	s, ok := a.currentAdminSession(r)
+	if !ok {
+		a.json(w, http.StatusUnauthorized, map[string]string{"error": "product administrator authentication required"})
+		return
+	}
+	a.json(w, http.StatusOK, map[string]any{"username": s.username, "display_name": s.displayName, "operator_id": s.operatorID, "platform_admin": true})
+}
+
+func (a *api) adminLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("phonarch_admin_session"); err == nil {
+		a.mu.Lock()
+		delete(a.adminSessions, c.Value)
+		a.mu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "phonarch_admin_session", MaxAge: -1, Path: "/"})
 	a.json(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -271,6 +336,120 @@ func (a *api) workspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.json(w, 200, map[string]any{"id": id, "slug": slug, "name": name, "status": status})
+}
+
+func (a *api) workspaceMembers(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := a.requireWorkspace(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == http.MethodGet {
+		rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.status,wm.role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY CASE wm.role WHEN 'OWNER' THEN 0 WHEN 'ADMIN' THEN 1 WHEN 'OPERATOR' THEN 2 ELSE 3 END,o.username`, workspaceID)
+		if err != nil {
+			a.json(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		members := []map[string]any{}
+		for rows.Next() {
+			var id, username, displayName, status, role string
+			if rows.Scan(&id, &username, &displayName, &status, &role) == nil {
+				members = append(members, map[string]any{"operator_id": id, "username": username, "display_name": displayName, "status": status, "role": role})
+			}
+		}
+		a.json(w, 200, members)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+		return
+	}
+	var in struct {
+		Username    string `json:"username"`
+		DisplayName string `json:"display_name"`
+		Password    string `json:"password"`
+		Role        string `json:"role"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || len(in.Password) < 8 {
+		a.json(w, 400, map[string]string{"error": "username and a password of at least 8 characters are required"})
+		return
+	}
+	if in.Role != "ADMIN" && in.Role != "VIEWER" {
+		in.Role = "OPERATOR"
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	var operatorID string
+	if err := tx.QueryRowContext(r.Context(), `INSERT INTO operators(username,password_hash,display_name,platform_role,status) VALUES($1,$2,$3,'WORKSPACE_OPERATOR','ACTIVE') RETURNING id::text`, strings.TrimSpace(in.Username), string(hash), strings.TrimSpace(in.DisplayName)).Scan(&operatorID); err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "username already exists"})
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `INSERT INTO workspace_members(workspace_id,operator_id,role) VALUES($1,$2,$3)`, workspaceID, operatorID, in.Role); err != nil {
+		a.json(w, http.StatusConflict, map[string]string{"error": "user could not be added to this workspace"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		a.json(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, http.StatusCreated, map[string]any{"operator_id": operatorID, "username": strings.TrimSpace(in.Username), "display_name": strings.TrimSpace(in.DisplayName), "role": in.Role, "status": "ACTIVE"})
+}
+
+func (a *api) workspaceMember(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := a.requireWorkspace(w, r)
+	if !ok {
+		return
+	}
+	operatorID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/workspace/members/"), "/")
+	if operatorID == "" || (r.Method != http.MethodPut && r.Method != http.MethodDelete) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+		return
+	}
+	var currentRole, platformRole string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT wm.role,o.platform_role FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 AND wm.operator_id=$2`, workspaceID, operatorID).Scan(&currentRole, &platformRole); err != nil {
+		a.json(w, 404, map[string]string{"error": "workspace member not found"})
+		return
+	}
+	if currentRole == "OWNER" || platformRole == "PLATFORM_OWNER" || platformRole == "PLATFORM_ADMIN" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "workspace owner and product administrator access cannot be changed here"})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		_, err := a.db.ExecContext(r.Context(), `DELETE FROM workspace_members WHERE workspace_id=$1 AND operator_id=$2`, workspaceID, operatorID)
+		if err != nil {
+			a.json(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		a.json(w, 200, map[string]string{"status": "removed", "operator_id": operatorID})
+		return
+	}
+	var in struct {
+		Role string `json:"role"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || (in.Role != "ADMIN" && in.Role != "OPERATOR" && in.Role != "VIEWER") {
+		a.json(w, 400, map[string]string{"error": "role must be ADMIN, OPERATOR, or VIEWER"})
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE workspace_members SET role=$1 WHERE workspace_id=$2 AND operator_id=$3`, in.Role, workspaceID, operatorID); err != nil {
+		a.json(w, 409, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, 200, map[string]string{"status": "saved", "operator_id": operatorID, "role": in.Role})
 }
 
 func (a *api) nodes(ctx context.Context) ([]node, error) {
@@ -423,6 +602,9 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 		}
 		a.json(w, 200, out)
 	case http.MethodPost:
+		if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+			return
+		}
 		var in struct {
 			Name string `json:"name"`
 		}
@@ -454,6 +636,16 @@ func (a *api) bridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bridgeID := parts[0]
+	configurationChange := r.Method == http.MethodDelete || (len(parts) == 2 && (parts[1] == "host" || parts[1] == "settings" || parts[1] == "participants" || parts[1] == "batches"))
+	if configurationChange {
+		if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+			return
+		}
+	} else if r.Method != http.MethodGet {
+		if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN", "OPERATOR"); !ok {
+			return
+		}
+	}
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		a.bridgeState(w, r, workspaceID, bridgeID)
 		return
@@ -1169,6 +1361,9 @@ func (a *api) action(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) != 2 {
 		if len(parts) == 1 && r.Method == http.MethodPut {
+			if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+				return
+			}
 			a.editRosterParticipant(w, r, parts[0])
 			return
 		}
@@ -1185,6 +1380,9 @@ func (a *api) action(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if action == "remove" {
+		if _, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN"); !ok {
+			return
+		}
 		var active int
 		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM call_legs WHERE participant_id=$1 AND workspace_id=$2 AND state NOT IN ('ENDED','FAILED','DROPPED')`, pid, workspaceID).Scan(&active); err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
@@ -1559,7 +1757,21 @@ func (a *api) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) adminOverview(w http.ResponseWriter, r *http.Request) {
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
 	var workspaces, rooms, users, tfns int
+	if workspaceID != "" {
+		var exists bool
+		if err := a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM workspaces WHERE id=$1)`, workspaceID).Scan(&exists); err != nil || !exists {
+			a.json(w, 404, map[string]string{"error": "workspace not found"})
+			return
+		}
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspaces WHERE id=$1 AND status='ACTIVE'`, workspaceID).Scan(&workspaces)
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM bridges WHERE workspace_id=$1 AND status='ACTIVE'`, workspaceID).Scan(&rooms)
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspace_members WHERE workspace_id=$1`, workspaceID).Scan(&users)
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM telephony_numbers WHERE workspace_id=$1 AND status='ACTIVE'`, workspaceID).Scan(&tfns)
+		a.json(w, http.StatusOK, map[string]any{"workspace_id": workspaceID, "workspaces": workspaces, "rooms": rooms, "users": users, "tfns": tfns})
+		return
+	}
 	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM workspaces WHERE status='ACTIVE'`).Scan(&workspaces)
 	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM bridges WHERE status='ACTIVE'`).Scan(&rooms)
 	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM operators WHERE status='ACTIVE'`).Scan(&users)
@@ -1642,7 +1854,12 @@ func (a *api) adminUpdateWorkspace(w http.ResponseWriter, r *http.Request, works
 }
 
 func (a *api) adminRooms(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT b.id::text,b.workspace_id::text,w.name,b.name,b.status,b.room_state,b.participant_limit,COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,'') FROM bridges b JOIN workspaces w ON w.id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id ORDER BY b.created_at DESC`)
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if workspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT b.id::text,b.workspace_id::text,w.name,b.name,b.status,b.room_state,b.participant_limit,COALESCE(t.id::text,''),COALESCE(t.e164_number,''),COALESCE(t.label,'') FROM bridges b JOIN workspaces w ON w.id=b.workspace_id LEFT JOIN telephony_numbers t ON t.id=b.tfn_id WHERE b.workspace_id=$1 ORDER BY b.created_at DESC`, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -1695,8 +1912,13 @@ func (a *api) adminUpdateRoom(w http.ResponseWriter, r *http.Request, roomID str
 		a.json(w, 400, map[string]string{"error": "name and positive participant_limit required"})
 		return
 	}
+	adminWorkspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if adminWorkspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
 	var workspaceID, roomState string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT workspace_id::text,room_state FROM bridges WHERE id=$1`, roomID).Scan(&workspaceID, &roomState); err != nil {
+	if err := a.db.QueryRowContext(r.Context(), `SELECT workspace_id::text,room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, roomID, adminWorkspaceID).Scan(&workspaceID, &roomState); err != nil {
 		a.json(w, 404, map[string]string{"error": "room not found"})
 		return
 	}
@@ -1730,7 +1952,12 @@ func (a *api) adminUpdateRoom(w http.ResponseWriter, r *http.Request, roomID str
 }
 
 func (a *api) adminTFNs(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT t.id::text,t.workspace_id::text,w.name,t.e164_number,t.label,t.provider_ref,t.status,COALESCE(b.id::text,''),COALESCE(b.name,'') FROM telephony_numbers t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN bridges b ON b.tfn_id=t.id ORDER BY t.created_at DESC`)
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if workspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT t.id::text,t.workspace_id::text,w.name,t.e164_number,t.label,t.provider_ref,t.status,COALESCE(b.id::text,''),COALESCE(b.name,'') FROM telephony_numbers t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN bridges b ON b.tfn_id=t.id WHERE t.workspace_id=$1 ORDER BY t.created_at DESC`, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -1772,7 +1999,12 @@ func (a *api) adminCreateTFN(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) adminDeleteTFN(w http.ResponseWriter, r *http.Request, tfnID string) {
-	result, err := a.db.ExecContext(r.Context(), `DELETE FROM telephony_numbers WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM bridges WHERE tfn_id=$1)`, tfnID)
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if workspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
+	result, err := a.db.ExecContext(r.Context(), `DELETE FROM telephony_numbers WHERE id=$1 AND workspace_id=$2 AND NOT EXISTS (SELECT 1 FROM bridges WHERE tfn_id=$1)`, tfnID, workspaceID)
 	if err != nil {
 		a.json(w, 409, map[string]string{"error": "TFN could not be removed"})
 		return
@@ -1837,7 +2069,12 @@ func (a *api) adminRemoveMember(w http.ResponseWriter, r *http.Request, workspac
 }
 
 func (a *api) adminUsers(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,username,COALESCE(display_name,''),platform_role,status,created_at FROM operators ORDER BY created_at DESC`)
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if workspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT o.id::text,o.username,COALESCE(o.display_name,''),o.platform_role,o.status,o.created_at FROM workspace_members wm JOIN operators o ON o.id=wm.operator_id WHERE wm.workspace_id=$1 ORDER BY o.created_at DESC`, workspaceID)
 	if err != nil {
 		a.json(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -1863,8 +2100,8 @@ func (a *api) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID   string `json:"workspace_id"`
 		WorkspaceRole string `json:"workspace_role"`
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || len(in.Password) < 8 {
-		a.json(w, 400, map[string]string{"error": "username and a password of at least 8 characters are required"})
+	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Username) == "" || len(in.Password) < 8 || strings.TrimSpace(in.WorkspaceID) == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id, username, and a password of at least 8 characters are required"})
 		return
 	}
 	if in.PlatformRole != "PLATFORM_ADMIN" {
@@ -1911,12 +2148,17 @@ func (a *api) adminUpdateUser(w http.ResponseWriter, r *http.Request, operatorID
 	if in.PlatformRole != "PLATFORM_ADMIN" && in.PlatformRole != "PLATFORM_OWNER" {
 		in.PlatformRole = "WORKSPACE_OPERATOR"
 	}
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if workspaceID == "" {
+		a.json(w, 400, map[string]string{"error": "workspace_id is required"})
+		return
+	}
 	var existingRole, existingStatus string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT platform_role,status FROM operators WHERE id=$1`, operatorID).Scan(&existingRole, &existingStatus); err != nil {
+	if err := a.db.QueryRowContext(r.Context(), `SELECT o.platform_role,o.status FROM operators o JOIN workspace_members wm ON wm.operator_id=o.id WHERE o.id=$1 AND wm.workspace_id=$2`, operatorID, workspaceID).Scan(&existingRole, &existingStatus); err != nil {
 		a.json(w, 404, map[string]string{"error": "user not found"})
 		return
 	}
-	current, currentOK := a.currentSession(r)
+	current, currentOK := a.currentAdminSession(r)
 	if currentOK && current.operatorID == operatorID && (in.Status != "ACTIVE" || (in.PlatformRole != "PLATFORM_ADMIN" && in.PlatformRole != "PLATFORM_OWNER")) {
 		a.json(w, http.StatusConflict, map[string]string{"error": "you cannot remove your own product administrator access"})
 		return
@@ -2040,7 +2282,7 @@ func (a *api) speakerRequests(w http.ResponseWriter, r *http.Request, workspaceI
 }
 
 func (a *api) speakerRequestAction(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := a.requireWorkspace(w, r)
+	workspaceID, _, ok := a.requireWorkspaceRole(w, r, "OWNER", "ADMIN", "OPERATOR")
 	if !ok {
 		return
 	}
@@ -2196,15 +2438,11 @@ func main() {
 		slog.Error("bootstrap product admin unavailable", "error", err)
 		os.Exit(1)
 	}
-	workspaceID := strings.TrimSpace(env("DEFAULT_WORKSPACE_ID", ""))
-	if workspaceID == "" {
-		_ = db.QueryRow(`SELECT id::text FROM workspaces WHERE slug=$1`, env("DEFAULT_WORKSPACE_SLUG", "operations")).Scan(&workspaceID)
-	}
 	rdb := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "127.0.0.1:6379")})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		slog.Warn("Redis unavailable; control API will use configured SipGo HTTP targets", "error", err)
 	}
-	a := &api{db: db, sipgoURLs: httpTargets(env("SIPGO_HTTP_TARGETS", env("SIPGO_HTTP", "http://127.0.0.1:8080"))), rdb: rdb, sessions: map[string]session{}, defaultWorkspaceID: workspaceID}
+	a := &api{db: db, sipgoURLs: httpTargets(env("SIPGO_HTTP_TARGETS", env("SIPGO_HTTP", "http://127.0.0.1:8080"))), rdb: rdb, sessions: map[string]session{}, adminSessions: map[string]session{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200); _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
@@ -2217,7 +2455,12 @@ func main() {
 	mux.HandleFunc("/api/v1/auth/login", a.login)
 	mux.HandleFunc("/api/v1/auth/logout", a.require(a.logout))
 	mux.HandleFunc("/api/v1/auth/me", a.require(a.me))
+	mux.HandleFunc("/api/v1/auth/admin/login", a.adminLogin)
+	mux.HandleFunc("/api/v1/auth/admin/logout", a.requirePlatformAdmin(a.adminLogout))
+	mux.HandleFunc("/api/v1/auth/admin/me", a.requirePlatformAdmin(a.adminMe))
 	mux.HandleFunc("/api/v1/workspace", a.require(a.workspace))
+	mux.HandleFunc("/api/v1/workspace/members", a.require(a.workspaceMembers))
+	mux.HandleFunc("/api/v1/workspace/members/", a.require(a.workspaceMember))
 	mux.HandleFunc("/api/v1/bridges", a.require(a.bridges))
 	mux.HandleFunc("/api/v1/bridges/", a.require(a.bridge))
 	mux.HandleFunc("/api/v1/participants/", a.require(a.action))

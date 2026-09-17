@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { ArrowLeft, Building2, Check, LockKeyhole, Phone, Plus, RefreshCw, Save, ShieldCheck, Trash2, UserPlus, Users, X } from "lucide-react";
+import { ArrowLeft, Building2, Check, LockKeyhole, LogOut, Phone, Plus, RefreshCw, Save, ShieldCheck, Trash2, UserPlus, Users, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_CONTROL_API_URL || "";
 
@@ -21,6 +21,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let payload: unknown = {};
   try { payload = raw ? JSON.parse(raw) : {}; } catch { payload = {}; }
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") window.location.href = "/admin/login";
     const message = payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string" ? payload.error : `Request failed (${response.status})`;
     throw new Error(message);
   }
@@ -61,28 +62,37 @@ export default function AdminPage() {
   const workspaceRooms = useMemo(() => rooms.filter((room) => room.workspace_id === selectedWorkspaceId), [rooms, selectedWorkspaceId]);
   const workspaceTFNs = useMemo(() => tfns.filter((tfn) => tfn.workspace_id === selectedWorkspaceId), [tfns, selectedWorkspaceId]);
 
-  async function load() {
+  async function loadDirectory() {
     setBusy(true);
     try {
-      const [nextOverview, nextWorkspaces, nextRooms, nextTFNs, nextUsers] = await Promise.all([
-        request<Overview>("/api/v1/admin/overview"),
-        request<Workspace[]>("/api/v1/admin/workspaces"),
-        request<Room[]>("/api/v1/admin/rooms"),
-        request<TFN[]>("/api/v1/admin/tfns"),
-        request<User[]>("/api/v1/admin/users"),
-      ]);
-      setOverview(nextOverview);
+      const nextWorkspaces = await request<Workspace[]>("/api/v1/admin/workspaces");
       setWorkspaces(nextWorkspaces);
-      setRooms(nextRooms);
-      setRoomLimitDrafts(Object.fromEntries(nextRooms.map((room) => [room.id, String(room.participant_limit)])));
-      setTfns(nextTFNs);
-      setUsers(nextUsers);
       setSelectedWorkspaceId((current) => current && nextWorkspaces.some((workspace) => workspace.id === current) ? current : nextWorkspaces[0]?.id || "");
       setMessage(null);
     } catch (error) {
       setMessage({ text: error instanceof Error ? error.message : "Product admin data could not be loaded", error: true });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function loadWorkspaceData(workspaceID: string) {
+    if (!workspaceID) { setOverview(null); setRooms([]); setTfns([]); setUsers([]); return; }
+    try {
+      const scope = `?workspace_id=${encodeURIComponent(workspaceID)}`;
+      const [nextOverview, nextRooms, nextTFNs, nextUsers] = await Promise.all([
+        request<Overview>(`/api/v1/admin/overview${scope}`),
+        request<Room[]>(`/api/v1/admin/rooms${scope}`),
+        request<TFN[]>(`/api/v1/admin/tfns${scope}`),
+        request<User[]>(`/api/v1/admin/users${scope}`),
+      ]);
+      setOverview(nextOverview);
+      setRooms(nextRooms);
+      setRoomLimitDrafts(Object.fromEntries(nextRooms.map((room) => [room.id, String(room.participant_limit)])));
+      setTfns(nextTFNs);
+      setUsers(nextUsers);
+    } catch (error) {
+      setMessage({ text: error instanceof Error ? error.message : "Workspace admin data could not be loaded", error: true });
     }
   }
 
@@ -95,14 +105,15 @@ export default function AdminPage() {
     }
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void loadDirectory(); }, []);
+  useEffect(() => { void loadWorkspaceData(selectedWorkspaceId); }, [selectedWorkspaceId]);
   useEffect(() => { void loadMembers(selectedWorkspaceId); }, [selectedWorkspaceId]);
 
   async function createWorkspace(event: FormEvent) {
     event.preventDefault(); setBusy(true);
     try {
       await request("/api/v1/admin/workspaces", { method: "POST", body: JSON.stringify({ name: workspaceName, slug: workspaceSlug, max_participants: Number(workspaceLimit) }) });
-      setWorkspaceName(""); setWorkspaceSlug(""); setWorkspaceLimit("500"); setMessage({ text: "Workspace created" }); await load();
+      setWorkspaceName(""); setWorkspaceSlug(""); setWorkspaceLimit("500"); setMessage({ text: "Workspace created" }); await loadDirectory();
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "Workspace could not be created", error: true }); } finally { setBusy(false); }
   }
 
@@ -110,7 +121,7 @@ export default function AdminPage() {
     event.preventDefault(); if (!selectedWorkspaceId) return; setBusy(true);
     try {
       await request("/api/v1/admin/rooms", { method: "POST", body: JSON.stringify({ workspace_id: selectedWorkspaceId, name: roomName, participant_limit: Number(roomLimit) }) });
-      setRoomName(""); setRoomLimit(selectedWorkspace?.max_participants ? String(selectedWorkspace.max_participants) : "500"); setMessage({ text: "Room created" }); await load();
+      setRoomName(""); setRoomLimit(selectedWorkspace?.max_participants ? String(selectedWorkspace.max_participants) : "500"); setMessage({ text: "Room created" }); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "Room could not be created", error: true }); } finally { setBusy(false); }
   }
 
@@ -118,7 +129,7 @@ export default function AdminPage() {
     event.preventDefault(); setBusy(true);
     try {
       await request("/api/v1/admin/users", { method: "POST", body: JSON.stringify({ username: userName, display_name: userDisplayName, password: userPassword, platform_role: userPlatformRole, workspace_id: selectedWorkspaceId, workspace_role: userRole }) });
-      setUserName(""); setUserDisplayName(""); setUserPassword(""); setMessage({ text: "User created and workspace access assigned" }); await load();
+      setUserName(""); setUserDisplayName(""); setUserPassword(""); setMessage({ text: "User created and workspace access assigned" }); await loadWorkspaceData(selectedWorkspaceId); await loadMembers(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "User could not be created", error: true }); } finally { setBusy(false); }
   }
 
@@ -126,7 +137,7 @@ export default function AdminPage() {
     event.preventDefault(); setBusy(true);
     try {
       await request("/api/v1/admin/tfns", { method: "POST", body: JSON.stringify({ workspace_id: selectedWorkspaceId, number: tfnNumber, label: tfnLabel }) });
-      setTfnNumber(""); setTfnLabel(""); setMessage({ text: "TFN added to the workspace pool" }); await load();
+      setTfnNumber(""); setTfnLabel(""); setMessage({ text: "TFN added to the workspace pool" }); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "TFN could not be added", error: true }); } finally { setBusy(false); }
   }
 
@@ -134,8 +145,8 @@ export default function AdminPage() {
     const participantLimit = Number(roomLimitDrafts[room.id] || room.participant_limit);
     setBusy(true);
     try {
-      await request(`/api/v1/admin/rooms/${room.id}`, { method: "PUT", body: JSON.stringify({ name: room.name, participant_limit: participantLimit, tfn_id: tfnID || null }) });
-      setMessage({ text: `${room.name} updated` }); await load();
+      await request(`/api/v1/admin/rooms/${room.id}?workspace_id=${encodeURIComponent(selectedWorkspaceId)}`, { method: "PUT", body: JSON.stringify({ name: room.name, participant_limit: participantLimit, tfn_id: tfnID || null }) });
+      setMessage({ text: `${room.name} updated` }); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "Room could not be updated", error: true }); } finally { setBusy(false); }
   }
 
@@ -143,7 +154,7 @@ export default function AdminPage() {
     event.preventDefault(); if (!selectedWorkspace) return; setBusy(true);
     try {
       await request(`/api/v1/admin/workspaces/${selectedWorkspace.id}`, { method: "PUT", body: JSON.stringify({ name: selectedWorkspace.name, status: selectedWorkspace.status, max_participants: selectedWorkspace.max_participants }) });
-      setMessage({ text: "Workspace policy saved" }); await load();
+      setMessage({ text: "Workspace policy saved" }); await loadDirectory(); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "Workspace could not be saved", error: true }); } finally { setBusy(false); }
   }
 
@@ -167,16 +178,20 @@ export default function AdminPage() {
     setBusy(true);
     try {
       const status = user.status === "ACTIVE" ? "DISABLED" : "ACTIVE";
-      await request(`/api/v1/admin/users/${user.id}`, { method: "PUT", body: JSON.stringify({ display_name: user.display_name, status, platform_role: user.platform_role }) });
-      setMessage({ text: `${user.display_name || user.username} is now ${status.toLowerCase()}` }); await load();
+      await request(`/api/v1/admin/users/${user.id}?workspace_id=${encodeURIComponent(selectedWorkspaceId)}`, { method: "PUT", body: JSON.stringify({ display_name: user.display_name, status, platform_role: user.platform_role }) });
+      setMessage({ text: `${user.display_name || user.username} is now ${status.toLowerCase()}` }); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "User status could not be changed", error: true }); } finally { setBusy(false); }
   }
 
   async function deleteTFN(tfn: TFN) {
     if (tfn.room_id || !window.confirm(`Remove ${tfn.number} from ${tfn.workspace_name}?`)) return; setBusy(true);
     try {
-      await request(`/api/v1/admin/tfns/${tfn.id}`, { method: "DELETE" }); setMessage({ text: `${tfn.number} removed` }); await load();
+      await request(`/api/v1/admin/tfns/${tfn.id}?workspace_id=${encodeURIComponent(selectedWorkspaceId)}`, { method: "DELETE" }); setMessage({ text: `${tfn.number} removed` }); await loadWorkspaceData(selectedWorkspaceId);
     } catch (error) { setMessage({ text: error instanceof Error ? error.message : "TFN could not be removed", error: true }); } finally { setBusy(false); }
+  }
+
+  async function logout() {
+    try { await request("/api/v1/auth/admin/logout", { method: "POST" }); } finally { window.location.href = "/admin/login"; }
   }
 
   if (message?.error && (message.text.includes("administrator access") || message.text.includes("authentication required"))) {
@@ -187,11 +202,11 @@ export default function AdminPage() {
     <main className="admin-shell">
       <header className="admin-topbar">
         <div className="admin-brand"><span className="brand-mark"><ShieldCheck size={16} /></span><span><strong>Phonarch</strong><small>Product administration</small></span></div>
-        <div className="admin-top-actions"><span className="admin-security"><LockKeyhole size={13} /> Owner-only console</span><button className="button ghost compact-button" onClick={() => { window.location.href = "/"; }}><ArrowLeft size={14} /> Workspace</button><button className="icon-button" title="Refresh admin data" aria-label="Refresh admin data" onClick={() => void load()}><RefreshCw size={15} /></button></div>
+        <div className="admin-top-actions"><span className="admin-security"><LockKeyhole size={13} /> Owner-only console</span><button className="button ghost compact-button" onClick={() => { window.location.href = "/"; }}><ArrowLeft size={14} /> Workspace</button><button className="icon-button" title="Refresh admin data" aria-label="Refresh admin data" onClick={() => { void loadDirectory(); void loadWorkspaceData(selectedWorkspaceId); void loadMembers(selectedWorkspaceId); }}><RefreshCw size={15} /></button><button className="button ghost compact-button" onClick={() => void logout()}><LogOut size={14} /> Sign out</button></div>
       </header>
       {message && <div className={`admin-notice ${message.error ? "error" : "success"}`}>{message.error ? <X size={14} /> : <Check size={14} />}{message.text}</div>}
       <section className="admin-heading"><div><div className="eyebrow">Control plane</div><h1>Platform administration</h1><p>Provision workspaces, allocate room phone numbers, set capacity policy, and control customer access from one protected surface.</p></div><span className="admin-badge"><ShieldCheck size={14} /> No self-signup</span></section>
-      {overview && <div className="admin-metrics"><AdminMetric label="Active workspaces" value={overview.workspaces} icon={Building2} /><AdminMetric label="Conference rooms" value={overview.rooms} icon={Phone} /><AdminMetric label="Managed users" value={overview.users} icon={Users} /><AdminMetric label="Active TFNs" value={overview.tfns} icon={ShieldCheck} /></div>}
+      {overview && <div className="admin-metrics"><AdminMetric label="Selected workspace" value={overview.workspaces} icon={Building2} /><AdminMetric label="Conference rooms" value={overview.rooms} icon={Phone} /><AdminMetric label="Workspace users" value={overview.users} icon={Users} /><AdminMetric label="Active TFNs" value={overview.tfns} icon={ShieldCheck} /></div>}
       <div className="admin-layout">
         <section className="admin-main-column">
           <section className="panel admin-panel"><div className="admin-panel-heading"><div><div className="eyebrow">Tenant directory</div><h2>Workspaces</h2><p className="subtle">Each workspace is an isolated customer boundary for rooms, members, and phone numbers.</p></div><Building2 size={18} /></div><div className="admin-workspace-list">{workspaces.map((workspace) => <button type="button" key={workspace.id} className={`admin-workspace-card ${selectedWorkspaceId === workspace.id ? "active" : ""}`} onClick={() => setSelectedWorkspaceId(workspace.id)}><span className="admin-workspace-mark">{initials(workspace.name)}</span><span><strong>{workspace.name}</strong><small>{workspace.slug} · {workspace.room_count} rooms · {workspace.tfn_count} TFNs</small></span><span className="admin-card-value">{workspace.max_participants}<small>per room</small></span></button>)}</div><form className="admin-inline-form" onSubmit={(event) => void createWorkspace(event)}><input className="field-control" value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} placeholder="New workspace name" required /><input className="field-control" value={workspaceSlug} onChange={(event) => setWorkspaceSlug(event.target.value)} placeholder="slug (optional)" /><input className="field-control admin-number" type="number" min="1" value={workspaceLimit} onChange={(event) => setWorkspaceLimit(event.target.value)} aria-label="Workspace participant limit" /><button className="button primary" disabled={busy}><Plus size={14} /> Create workspace</button></form></section>
