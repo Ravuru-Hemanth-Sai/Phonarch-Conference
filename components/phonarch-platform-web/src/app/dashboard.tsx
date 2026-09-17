@@ -111,6 +111,21 @@ function localPhonePart(phone: string, region: string): string {
   return trimmed.startsWith("+") ? digits : trimmed;
 }
 
+function localPhoneDigits(phone: string): string {
+  return phone.replace(/\D/g, "").slice(0, 10);
+}
+
+function hasTenLocalDigits(phone: string): boolean {
+  return /^\d{10}$/.test(phone.replace(/\D/g, ""));
+}
+
+function normalizeE164(phone: string): string {
+  const trimmed = phone.trim();
+  const digits = trimmed.replace(/\D/g, "");
+  if (!digits) return "";
+  return trimmed.startsWith("+") ? `+${digits}` : `+${digits}`;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const scopedPath = requestScope.admin && requestScope.workspaceID
     ? `${path}${path.includes("?") ? "&" : "?"}workspace_id=${encodeURIComponent(requestScope.workspaceID)}`
@@ -521,43 +536,48 @@ function RoomSettingsPanel(props: RoomSettingsProps) {
 }
 
 function AdminRoomPolicy({ room, state, onRefresh, notify, adminMode = false }: RoomSettingsProps) {
-  const [tfns, setTFNs] = useState<Array<{ id: string; number: string; label: string; room_id: string }>>([]);
+  const [tfns, setTFNs] = useState<Array<{ id: string; number: string; label: string; room_id?: string }>>([]);
   const [participantLimit, setParticipantLimit] = useState(String(state.participant_limit || room.participant_limit || 500));
-  const [tfnID, setTFNID] = useState(state.tfn?.id || room.tfn_id || "");
+  const [tfnNumber, setTFNNumber] = useState(state.tfn?.number || room.tfn_number || "");
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [newTFN, setNewTFN] = useState("");
-  const [newTFNLabel, setNewTFNLabel] = useState("");
-  const [addingTFN, setAddingTFN] = useState(false);
   const locked = state.room_state === "RUNNING" || state.room_state === "STARTING";
+
   useEffect(() => {
     setParticipantLimit(String(state.participant_limit || room.participant_limit || 500));
-    setTFNID(state.tfn?.id || room.tfn_id || "");
-  }, [room.participant_limit, room.tfn_id, state.participant_limit, state.tfn?.id]);
+    setTFNNumber(state.tfn?.number || room.tfn_number || "");
+  }, [room.participant_limit, room.tfn_number, state.participant_limit, state.tfn?.number]);
+
   useEffect(() => {
     if (!adminMode) return;
-    void request<Array<{ id: string; number: string; label: string; room_id: string }>>("/api/v1/admin/tfns").then(setTFNs).catch(() => undefined);
+    void request<Array<{ id: string; number: string; label: string; room_id?: string }>>("/api/v1/admin/tfns").then(setTFNs).catch(() => undefined);
   }, [adminMode]);
+
   async function savePolicy(event: FormEvent) {
     event.preventDefault(); setBusy(true);
     try {
+      const normalizedTFN = normalizeE164(tfnNumber);
+      if (normalizedTFN && !/^\+\d{8,15}$/.test(normalizedTFN)) throw new Error("TFN / DID must be a valid E.164 number");
+      let tfnID = "";
+      if (normalizedTFN) {
+        const existing = tfns.find((tfn) => normalizeE164(tfn.number) === normalizedTFN);
+        if (existing) {
+          tfnID = existing.id;
+        } else {
+          if (!state.workspace_id) throw new Error("The room workspace is not available for TFN registration");
+          const created = await request<{ id: string; number: string; label: string; room_id?: string }>("/api/v1/admin/tfns", { method: "POST", body: JSON.stringify({ workspace_id: state.workspace_id, number: normalizedTFN }) });
+          tfnID = created.id;
+          setTFNs((current) => [created, ...current]);
+        }
+      }
       await request(`/api/v1/admin/rooms/${room.id}`, { method: "PUT", body: JSON.stringify({ name: room.name, participant_limit: Number(participantLimit), tfn_id: tfnID || null }) });
-      notify("Room TFN and participant limit saved"); onRefresh();
+      setTFNNumber(normalizedTFN); setEditing(false); notify("Room TFN / DID and participant limit saved"); onRefresh();
     } catch (error) { notify(error instanceof Error ? error.message : "Room policy could not be saved", "error"); } finally { setBusy(false); }
   }
-  async function registerTFN() {
-    if (!state.workspace_id || !newTFN.trim()) return;
-    setAddingTFN(true);
-    try {
-      const created = await request<{ id: string; number: string; label: string; room_id: string }>("/api/v1/admin/tfns", { method: "POST", body: JSON.stringify({ workspace_id: state.workspace_id, number: newTFN.trim(), label: newTFNLabel.trim() }) });
-      setTFNs((current) => [created, ...current]);
-      setTFNID(created.id);
-      setNewTFN(""); setNewTFNLabel("");
-      notify("TFN / DID registered; save the room allocation to assign it");
-    } catch (error) { notify(error instanceof Error ? error.message : "TFN / DID could not be registered", "error"); } finally { setAddingTFN(false); }
-  }
-  const assignedTFN = tfns.find((tfn) => tfn.id === tfnID)?.number || state.tfn?.number || room.tfn_number || "Not assigned";
-  return <section className="room-setting-card panel admin-room-policy-panel"><div className="room-setting-card-icon"><ShieldCheck size={17} /></div><div className="room-setting-card-copy"><div className="eyebrow">Room allocation</div><h3>{adminMode ? "TFN / DID and capacity" : "Product allocation"}</h3><p>{adminMode ? "Assign the caller identity and concurrency limit used by this room." : "The product administrator controls this room’s caller identity and concurrency limit."}</p><div className="room-policy-summary"><span><strong>{assignedTFN}</strong><small>Assigned TFN / DID</small></span><span><strong>{participantLimit}</strong><small>Max callers</small></span></div></div>{adminMode ? <button type="button" className="button ghost compact-button" onClick={() => setEditing((value) => !value)} disabled={locked}><Edit3 size={14} /> {locked ? "Locked live" : editing ? "Close" : "Edit card"}</button> : <span className="ownership-label"><LockKeyhole size={12} /> View only</span>}{editing && <><div className="admin-tfn-register"><div><strong>Register a TFN / DID</strong><small>Use E.164 format, for example +919876543210.</small></div><div className="admin-tfn-register-fields"><input className="field-control" value={newTFN} onChange={(event) => setNewTFN(event.target.value)} placeholder="+919876543210" /><input className="field-control" value={newTFNLabel} onChange={(event) => setNewTFNLabel(event.target.value)} placeholder="Primary India number" /><button type="button" className="button ghost compact-button" onClick={() => void registerTFN()} disabled={addingTFN || !newTFN.trim()}>{addingTFN ? "Adding…" : <><Plus size={14} /> Register</>}</button></div></div><form className="admin-room-policy-form" onSubmit={(event) => void savePolicy(event)}><label className="field-label">Assigned TFN / DID<select className="field-control" value={tfnID} onChange={(event) => setTFNID(event.target.value)} disabled={busy || locked}><option value="">No TFN assigned</option>{tfns.map((tfn) => <option key={tfn.id} value={tfn.id}>{tfn.number}{tfn.room_id && tfn.room_id !== room.id ? " · assigned" : ""}</option>)}</select></label><label className="field-label">Concurrency limit<input className="field-control" type="number" min="1" value={participantLimit} onChange={(event) => setParticipantLimit(event.target.value)} disabled={busy || locked} /></label><button className="button primary" disabled={busy || locked}><Save size={14} /> Save allocation</button></form></>}</section>;
+
+  const assignedTFN = tfnNumber || "Not assigned";
+  const datalistID = `room-tfns-${room.id}`;
+  return <section className="room-setting-card panel admin-room-policy-panel"><div className="room-setting-card-icon"><ShieldCheck size={17} /></div><div className="room-setting-card-copy"><div className="eyebrow">Room allocation</div><h3>{adminMode ? "TFN / DID and capacity" : "Product allocation"}</h3><p>{adminMode ? "One caller identity and one concurrency limit are saved directly to this room." : "The product administrator controls this room’s caller identity and concurrency limit."}</p><div className="room-policy-summary"><span><strong>{assignedTFN}</strong><small>Assigned TFN / DID</small></span><span><strong>{participantLimit}</strong><small>Max callers</small></span></div></div>{adminMode ? <button type="button" className="button ghost compact-button" onClick={() => setEditing((value) => !value)} disabled={locked}><Edit3 size={14} /> {locked ? "Locked live" : editing ? "Close" : "Edit card"}</button> : <span className="ownership-label"><LockKeyhole size={12} /> View only</span>}{editing && <form className="admin-room-policy-form" onSubmit={(event) => void savePolicy(event)}><label className="field-label">Room TFN / DID<input className="field-control" type="tel" inputMode="tel" list={datalistID} value={tfnNumber} onChange={(event) => setTFNNumber(event.target.value)} placeholder="+919876543210" disabled={busy || locked} /><datalist id={datalistID}>{tfns.map((tfn) => <option key={tfn.id} value={tfn.number}>{tfn.label || "Existing number"}</option>)}</datalist><small className="field-hint">Enter an existing number or a new E.164 number. A new number is registered and assigned in this same save.</small></label><label className="field-label">Concurrency limit<input className="field-control" type="number" min="1" value={participantLimit} onChange={(event) => setParticipantLimit(event.target.value)} disabled={busy || locked} /></label><button className="button primary" disabled={busy || locked}><Save size={14} /> Save TFN / DID</button></form>}</section>;
 }
 
 function RoomSettingsForm({ room, state, onRefresh, notify }: RoomSettingsProps) {
@@ -576,24 +596,29 @@ function RoomSettingsForm({ room, state, onRefresh, notify }: RoomSettingsProps)
     try { await request(`/api/v1/bridges/${room.id}/settings`, { method: "PUT", body: JSON.stringify({ default_region: defaultRegion }) }); notify(`Default dialing region set to ${defaultRegion}`); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Dialing region could not be saved", "error"); } finally { setBusy(false); }
   }
   async function saveHost(event: FormEvent) {
-    event.preventDefault(); setBusy(true);
+    event.preventDefault();
+    if (!hasTenLocalDigits(hostPhone)) { notify("Host phone number must be exactly 10 digits after the region prefix", "error"); return; }
+    setBusy(true);
     try { await request(`/api/v1/bridges/${room.id}/host`, { method: "PUT", body: JSON.stringify({ name: hostName.trim(), phone_number: normalizePhone(hostPhone, defaultRegion) }) }); await request(`/api/v1/bridges/${room.id}/settings`, { method: "PUT", body: JSON.stringify({ default_region: defaultRegion }) }); notify("Room host and dialing defaults saved"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Host could not be saved", "error"); } finally { setBusy(false); }
   }
   async function clearHost() { setBusy(true); try { await request(`/api/v1/bridges/${room.id}/host`, { method: "DELETE" }); setHostName(""); setHostPhone(""); notify("Room host cleared"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Host could not be cleared", "error"); } finally { setBusy(false); } }
   async function addParticipant(event: FormEvent) {
-    event.preventDefault(); setBusy(true);
-    try { await request(`/api/v1/bridges/${room.id}/participants`, { method: "POST", body: JSON.stringify({ name: participantName.trim(), phone_number: participantPhone.trim(), role: "LISTENER" }) }); setParticipantName(""); setParticipantPhone(""); notify("Participant added to the fixed roster"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Participant could not be added", "error"); } finally { setBusy(false); }
+    event.preventDefault();
+    if (!hasTenLocalDigits(participantPhone)) { notify("Participant phone number must be exactly 10 digits after the region prefix", "error"); return; }
+    setBusy(true);
+    try { await request(`/api/v1/bridges/${room.id}/participants`, { method: "POST", body: JSON.stringify({ name: participantName.trim(), phone_number: normalizePhone(participantPhone, defaultRegion), role: "LISTENER" }) }); setParticipantName(""); setParticipantPhone(""); notify("Participant added to the fixed roster"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Participant could not be added", "error"); } finally { setBusy(false); }
   }
   async function removeParticipant(id: string) { try { await request(`/api/v1/participants/${id}/remove`, { method: "POST", body: "{}" }); notify("Participant removed from the fixed roster"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Participant could not be removed", "error"); } }
-  function beginEdit(participant: Participant) { setEditingParticipant(participant); setEditingName(participant.name); setEditingPhone(participant.phone_number); }
+  function beginEdit(participant: Participant) { setEditingParticipant(participant); setEditingName(participant.name); setEditingPhone(localPhonePart(participant.phone_number, defaultRegion)); }
   async function saveParticipant(event: FormEvent) {
     event.preventDefault();
     if (!editingParticipant) return;
+    if (!hasTenLocalDigits(editingPhone)) { notify("Participant phone number must be exactly 10 digits after the region prefix", "error"); return; }
     setBusy(true);
-    try { await request(`/api/v1/participants/${editingParticipant.participant_id}`, { method: "PUT", body: JSON.stringify({ name: editingName.trim(), phone_number: editingPhone.trim() }) }); setEditingParticipant(null); notify("Participant roster details saved"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Participant could not be saved", "error"); } finally { setBusy(false); }
+    try { await request(`/api/v1/participants/${editingParticipant.participant_id}`, { method: "PUT", body: JSON.stringify({ name: editingName.trim(), phone_number: normalizePhone(editingPhone, defaultRegion) }) }); setEditingParticipant(null); notify("Participant roster details saved"); onRefresh(); } catch (error) { notify(error instanceof Error ? error.message : "Participant could not be saved", "error"); } finally { setBusy(false); }
   }
   const roster = state.participants.filter((participant) => participant.role !== "HOST");
-  return <section className="room-settings-grid"><div className="panel settings-main host-panel"><div className="settings-section-title"><div><div className="eyebrow">Room host</div><h2>Fixed host details</h2><p className="subtle">The host is always called first when this room starts. Edit these details while the room is stopped.</p></div><ShieldCheck size={18} /></div><form className="host-form" onSubmit={(event) => void saveHost(event)}><label className="field-label">Host name<input className="field-control" value={hostName} onChange={(event) => setHostName(event.target.value)} placeholder="e.g. Maya Chen" required /></label><label className="field-label">Host phone number<span className="phone-composite"><select className="field-control phone-region" value={defaultRegion} onChange={(event) => setDefaultRegion(event.target.value)} aria-label="Host phone country or region">{dialRegions.map((region) => <option key={region.code} value={region.code}>{region.code}</option>)}</select><input className="field-control" value={hostPhone} onChange={(event) => setHostPhone(event.target.value)} placeholder="98765 43210" inputMode="tel" required /></span>{normalizePhone(hostPhone, defaultRegion) && <small className="phone-preview">Will dial {normalizePhone(hostPhone, defaultRegion)}</small>}</label><div className="settings-action-row"><button className="button primary" disabled={busy}>{busy ? "Saving…" : "Save host"}</button><button type="button" className="button ghost danger-button" onClick={() => void clearHost()} disabled={busy || !hostName}>Clear host</button></div></form><form className="dialing-defaults" onSubmit={(event) => void saveDialingRegion(event)}><div><div className="eyebrow">Dialing defaults</div><h3>{dialRegions.find((region) => region.code === defaultRegion)?.label || defaultRegion}</h3><p className="subtle">The region beside the host number is also the default for local numbers entered by the live dialer and fixed roster.</p></div><button className="button ghost compact-button" disabled={busy}>Save dialing region</button></form></div><div className="panel settings-main roster-panel"><div className="settings-section-title"><div><div className="eyebrow">Fixed participants</div><h2>Roster before the call</h2><p className="subtle">Listeners join muted by default. They stay assigned to this room across sessions.</p></div><Users size={18} /></div><form className="roster-add-form" onSubmit={(event) => void addParticipant(event)}><input className="field-control" value={participantName} onChange={(event) => setParticipantName(event.target.value)} placeholder="Participant name" required /><input className="field-control" value={participantPhone} onChange={(event) => setParticipantPhone(event.target.value)} placeholder="Phone number" inputMode="tel" required /><button className="button primary" disabled={busy}><Plus size={14} /> Add</button></form>{roster.length ? <div className="roster-list">{roster.map((participant) => editingParticipant?.participant_id === participant.participant_id ? <form className="roster-edit-row" key={participant.participant_id} onSubmit={(event) => void saveParticipant(event)}><input className="field-control" value={editingName} onChange={(event) => setEditingName(event.target.value)} aria-label="Edit participant name" required /><input className="field-control" value={editingPhone} onChange={(event) => setEditingPhone(event.target.value)} aria-label="Edit participant phone number" inputMode="tel" required /><button className="button primary compact-button" disabled={busy}>Save</button><button type="button" className="button ghost compact-button" onClick={() => setEditingParticipant(null)}>Cancel</button></form> : <div className="roster-row" key={participant.participant_id}><span className="participant-avatar">{initials(participant.name || participant.phone_number)}</span><span><strong>{participant.name || "Unnamed participant"}</strong><small>{participant.phone_number}</small></span><span className="role-pill">Listener</span><span className="roster-row-actions"><button type="button" className="icon-button" title="Edit participant" onClick={() => beginEdit(participant)}><Pencil size={14} /></button><button type="button" className="icon-button danger" title="Remove participant from roster" onClick={() => void removeParticipant(participant.participant_id)}><Trash2 size={14} /></button></span></div>)}</div> : <div className="session-empty"><Users size={17} /><span><strong>No fixed participants</strong><small>Add them manually or import a Name, Phone Number, Role file.</small></span></div>}</div></section>;
+  return <section className="room-settings-grid"><section className="panel settings-main room-region-card"><div className="settings-section-title"><div><div className="eyebrow">Room dialing region</div><h2>Default phone region</h2><p className="subtle">Choose the country prefix once. Host and participant forms use this prefix automatically.</p></div><Network size={18} /></div><form className="room-region-form" onSubmit={(event) => void saveDialingRegion(event)}><label className="field-label">Default region<select className="field-control" value={defaultRegion} onChange={(event) => setDefaultRegion(event.target.value)}>{dialRegions.map((region) => <option key={region.code} value={region.code}>{region.label}</option>)}</select></label><div className="room-region-example"><span>Local number format</span><strong>{defaultRegion} + 10 digits</strong><small>Example: {defaultRegion} 9876543210</small></div><button className="button primary compact-button" disabled={busy}><Save size={14} /> Save region</button></form></section><div className="panel settings-main host-panel"><div className="settings-section-title"><div><div className="eyebrow">Room host</div><h2>Fixed host details</h2><p className="subtle">The host is always called first when this room starts. Edit these details while the room is stopped.</p></div><ShieldCheck size={18} /></div><form className="host-form" onSubmit={(event) => void saveHost(event)}><label className="field-label">Host name<input className="field-control" value={hostName} onChange={(event) => setHostName(event.target.value)} placeholder="e.g. Maya Chen" required /></label><label className="field-label">Host phone number<span className="phone-composite"><span className="phone-region-fixed">{defaultRegion}</span><input className="field-control" value={hostPhone} onChange={(event) => setHostPhone(localPhoneDigits(event.target.value))} placeholder="9876543210" inputMode="numeric" minLength={10} maxLength={10} pattern="[0-9]{10}" required /></span><small className="phone-hint">Enter exactly 10 local digits. The room prefix will be added automatically.</small>{normalizePhone(hostPhone, defaultRegion) && <small className="phone-preview">Will dial {normalizePhone(hostPhone, defaultRegion)}</small>}</label><div className="settings-action-row"><button className="button primary" disabled={busy}>{busy ? "Saving…" : "Save host"}</button><button type="button" className="button ghost danger-button" onClick={() => void clearHost()} disabled={busy || !hostName}>Clear host</button></div></form></div><div className="panel settings-main roster-panel"><div className="settings-section-title"><div><div className="eyebrow">Fixed participants</div><h2>Roster before the call</h2><p className="subtle">Listeners join muted by default. They stay assigned to this room across sessions.</p></div><Users size={18} /></div><form className="roster-add-form" onSubmit={(event) => void addParticipant(event)}><input className="field-control" value={participantName} onChange={(event) => setParticipantName(event.target.value)} placeholder="Participant name" required /><span className="phone-composite"><span className="phone-region-fixed">{defaultRegion}</span><input className="field-control" value={participantPhone} onChange={(event) => setParticipantPhone(localPhoneDigits(event.target.value))} placeholder="9876543210" inputMode="numeric" minLength={10} maxLength={10} pattern="[0-9]{10}" required /></span><button className="button primary" disabled={busy}><Plus size={14} /> Add</button></form><small className="phone-hint roster-phone-hint">Participant number must be exactly 10 local digits.</small>{roster.length ? <div className="roster-list">{roster.map((participant) => editingParticipant?.participant_id === participant.participant_id ? <form className="roster-edit-row" key={participant.participant_id} onSubmit={(event) => void saveParticipant(event)}><input className="field-control" value={editingName} onChange={(event) => setEditingName(event.target.value)} aria-label="Edit participant name" required /><span className="phone-composite"><span className="phone-region-fixed">{defaultRegion}</span><input className="field-control" value={editingPhone} onChange={(event) => setEditingPhone(localPhoneDigits(event.target.value))} aria-label="Edit participant phone number" inputMode="numeric" minLength={10} maxLength={10} pattern="[0-9]{10}" required /></span><button className="button primary compact-button" disabled={busy}>Save</button><button type="button" className="button ghost compact-button" onClick={() => setEditingParticipant(null)}>Cancel</button></form> : <div className="roster-row" key={participant.participant_id}><span className="participant-avatar">{initials(participant.name || participant.phone_number)}</span><span><strong>{participant.name || "Unnamed participant"}</strong><small>{participant.phone_number}</small></span><span className="role-pill">Listener</span><span className="roster-row-actions"><button type="button" className="icon-button" title="Edit participant" onClick={() => beginEdit(participant)}><Pencil size={14} /></button><button type="button" className="icon-button danger" title="Remove participant from roster" onClick={() => void removeParticipant(participant.participant_id)}><Trash2 size={14} /></button></span></div>)}</div> : <div className="session-empty"><Users size={17} /><span><strong>No fixed participants</strong><small>Add them manually or import a Name, Phone Number, Role file.</small></span></div>}</div></section>;
 }
 
 function LiveControl({ room, live, requests, onAction, onVolume, onSpeakerAction, onDial, defaultRegion }: { room: Bridge; live: Participant[]; requests: SpeakerRequest[]; onAction: (participantId: string, action: "mute" | "unmute" | "drop" | "add") => Promise<void>; onVolume: (participantId: string) => Promise<void>; onSpeakerAction: (requestID: string, action: "grant" | "withdraw") => Promise<void>; onDial: (name: string, phone: string) => Promise<void>; defaultRegion: string }) {
