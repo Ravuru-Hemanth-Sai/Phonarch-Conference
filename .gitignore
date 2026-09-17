@@ -1,0 +1,21 @@
+# Generated build output and native runtime state
+/build/
+/runtime/
+/toolchain/
+/toolchains/
+
+# Local reference checkout and deployment-only material
+/reference/
+/config/phonarch.env
+
+# Next.js generated/dependency directories
+/ui/node_modules/
+/ui/.next/
+/ui/tsconfig.tsbuildinfo
+
+# Local logs, pid files, databases, and editor metadata
+*.log
+*.pid
+*.rdb
+*.aof
+.DS_Store

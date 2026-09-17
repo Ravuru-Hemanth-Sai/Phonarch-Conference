@@ -1,0 +1,58 @@
+# RustPBX adapter contract. The RustPBX binary is supplied separately.
+[node]
+id = "${NODE_ID}"
+private_ip = "${PRIVATE_IP}"
+media_public_ip = "${MEDIA_PUBLIC_IP}"
+role = "listener"
+capacity = 500
+soft_capacity = 350
+hard_cpu_percent = 80
+drain_state = "READY"
+
+[sip]
+listen_udp = "${PRIVATE_IP}:${SIP_UDP_PORT}"
+listen_tcp = "${PRIVATE_IP}:${SIP_TCP_PORT}"
+# SipGo edges are discovered dynamically from Redis by the sidecar/control
+# plane. A deployment renderer may populate this list for a RustPBX engine
+# that requires static bootstrap peers.
+edge_proxies = []
+transport = ["udp", "tcp"]
+
+[rtp]
+min_port = 20000
+max_port = 30000
+codecs = ["PCMU/8000", "PCMA/8000"]
+telephone_event = true
+relay_mode = "symmetric"
+advertised_ip = "${MEDIA_PUBLIC_IP}"
+
+[conference]
+mixing = true
+max_participants = 500
+max_active_speakers = 16
+late_join = true
+admin_control = true
+
+[media_ha]
+# Room roots are assigned by the control plane. A leaf keeps two private RTP
+# inputs and its selector emits one stable downstream RTP stream per room.
+root_failover = true
+root_switch_timeout = "300ms"
+preserve_downstream_ssrc = true
+room_epoch_fencing = true
+
+[sidecar]
+listen = "${PRIVATE_IP}:${SIDECAR_PORT}"
+rustpbx_control_url = "http://${PRIVATE_IP}:${RUSTPBX_CONTROL_PORT}"
+# The sidecar resolves active SipGo edges from Redis keyspace
+# active-sipgo:*; this is intentionally empty in the generic template.
+sipgo_heartbeat_targets = []
+heartbeat_interval = "2s"
+heartbeat_lease = "7s"
+event_url = "${CONTROL_API_INTERNAL_URL}/internal/v1/events"
+
+[database]
+url = "postgres://phonarch:phonarch@127.0.0.1:5432/phonarch?sslmode=disable"
+
+[redis]
+url = "redis://127.0.0.1:6379/0"
