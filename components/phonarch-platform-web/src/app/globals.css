@@ -445,3 +445,18 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 @media (max-width: 1050px) { .room-region-form { grid-template-columns: 1fr 1fr; }.room-region-form .button { justify-self: start; }.room-governance-card { align-items: flex-start; flex-direction: column; }.room-governance-items { width: 100%; }.room-governance-items > div { flex: 1; } }
 @media (max-width: 850px) { .room-settings-intro-card { align-items: flex-start; flex-direction: column; gap: 13px; }.room-settings-grid > .panel { padding: 21px; }.room-region-form { grid-template-columns: 1fr; }.room-region-form .button { width: fit-content; }.room-governance-items { flex-wrap: wrap; }.room-governance-items > div { min-width: 130px; }.admin-room-policy-panel { grid-template-columns: 44px minmax(0,1fr); }.admin-room-policy-panel > .button, .admin-room-policy-panel > .ownership-label { grid-column: 2; justify-self: start; }.admin-room-policy-panel .admin-room-policy-form { grid-column: 1 / -1; grid-template-columns: 1fr 1fr; }.admin-room-policy-panel .admin-room-policy-form .button { grid-column: 1 / -1; justify-self: start; } }
 @media (max-width: 650px) { .room-settings-intro-card { padding: 18px; }.room-settings-intro-card h2 { font-size: 19px; }.room-settings-intro-card p { font-size: 11px; }.room-settings-grid > .panel { padding: 18px; }.room-settings-grid .settings-section-title h2 { font-size: 19px; }.room-settings-grid .settings-section-title .subtle { font-size: 11px; }.room-governance-card { padding: 18px; }.room-governance-items { display: grid; grid-template-columns: 1fr 1fr; }.room-governance-items > div { min-width: 0; }.admin-room-policy-panel { padding: 18px; }.admin-room-policy-panel .admin-room-policy-form { grid-template-columns: 1fr; }.admin-room-policy-panel .admin-room-policy-form .button { grid-column: auto; }.room-setting-card { grid-template-columns: 43px minmax(0,1fr); min-height: 0; padding: 18px; }.room-setting-card > .button { grid-column: 2; justify-self: start; }.room-setting-card-copy p { min-height: 0; }.roster-add-form { grid-template-columns: 1fr; }.roster-add-form .button { width: fit-content; }.roster-edit-row { grid-template-columns: 1fr; }.roster-edit-row .button { width: fit-content; }.roster-row { grid-template-columns: 34px minmax(0,1fr) auto; }.roster-row-actions { grid-column: 3; grid-row: 1; }.phone-composite { grid-template-columns: 78px minmax(0,1fr); } }
+
+/* Final room-settings layout pass: keep the setup sequence full width and prevent
+   narrow cards from creating an uneven settings canvas at tablet/desktop widths. */
+.room-settings-grid { grid-template-columns: minmax(0, 1fr); align-items: stretch; }
+.room-settings-grid > .panel { grid-column: 1; width: 100%; min-width: 0; }
+.room-settings-grid .host-form { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+.room-settings-grid .host-form .settings-action-row { grid-column: 1 / -1; }
+.room-settings-grid .roster-add-form { grid-template-columns: minmax(180px, .8fr) minmax(260px, 1fr) auto; }
+
+@media (max-width: 700px) {
+  .room-settings-grid .host-form { grid-template-columns: 1fr; }
+  .room-settings-grid .host-form .settings-action-row { grid-column: auto; }
+  .room-settings-grid .roster-add-form { grid-template-columns: 1fr; }
+  .room-settings-grid .roster-add-form .button { width: fit-content; }
+}
