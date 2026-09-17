@@ -1,17 +1,21 @@
 # Generated build output and native runtime state
-/build/
-/runtime/
 /toolchain/
 /toolchains/
 
+# Component-local build outputs and web caches
+/build/
+/components/**/bin/
+/components/phonarch-platform-web/node_modules/
+/components/phonarch-platform-web/.next/
+/components/phonarch-platform-web/tsconfig.tsbuildinfo
+
+# Host-local state and deployment secrets
+/state/runtime/
+/state/secrets/
+
 # Local reference checkout and deployment-only material
 /reference/
-/config/phonarch.env
 
-# Next.js generated/dependency directories
-/ui/node_modules/
-/ui/.next/
-/ui/tsconfig.tsbuildinfo
 
 # Local logs, pid files, databases, and editor metadata
 *.log

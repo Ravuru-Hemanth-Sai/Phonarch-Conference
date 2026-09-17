@@ -4,11 +4,36 @@ PhonArch Conference is a multi-tenant, moderated telephone conference platform f
 
 The product is deliberately phone-first. It uses SIP signaling and RTP media. The browser is an HTTP administration console; it is not a media endpoint.
 
+## Repository topology
+
+The repository follows the same component-oriented layout as the Phonarch voice
+platform:
+
+```text
+components/
+  phonarch-platform-api/       Go control API and PostgreSQL migrations
+  phonarch-platform-web/       Next.js operator console (`src/app`)
+  phonarch-sip-gateway/        Go/sipgo public SIP edge
+  phonarch-pbx-sidecar/        Go per-core command and heartbeat service
+  phonarch-rustpbx/            RustPBX adapter contract and heartbeat utility
+  phonarch-rustpbx-lab/        x86_64/ARM64 mock core for local validation
+  phonarch-sip-probe/          SIP/RTP lab probe
+deploy/                        native build/start/stop/status scripts and env template
+docs/                          architecture and adapter documentation
+state/config/                  versioned host topology/configuration
+state/secrets/                ignored deployment credentials
+state/runtime/                ignored logs, PIDs, Redis, and local runtime data
+```
+
+Every component owns its source, module/package manifest, tests, and generated
+`bin/` output. The deploy scripts orchestrate components but do not contain
+service implementation code.
+
 ## Current delivery status
 
 This repository contains a native lab-ready control plane, UI, SIP edge, sidecar contract, PostgreSQL tenancy model, Redis leases, and RustPBX adapter configuration. It also contains a mock RustPBX so the UI and call state workflow can be exercised on x86_64.
 
-The real RustPBX media engine remains an external executable. The files under `/data/rustpbx` describe the production configuration and the media-control contract; they do not pretend to be a new mixer implementation. A production rollout must connect the sidecar contract to the RustPBX build that owns SIP/RTP, conference mixing, RTP fan-out, DTMF extraction, recording policy, and media failover.
+The real RustPBX media engine remains an external executable. The files under `/data/components/phonarch-rustpbx` describe the production configuration and the media-control contract; they do not pretend to be a new mixer implementation. A production rollout must connect the sidecar contract to the RustPBX build that owns SIP/RTP, conference mixing, RTP fan-out, DTMF extraction, recording policy, and media failover.
 
 The HA model below is the target production design. The code already provides the state, routing, lease, fencing, and control boundaries required to implement it, but a lab with the mock engine is not proof of 10,000 concurrent calls or sub-second audio failover.
 
@@ -223,7 +248,7 @@ When X is muted, the leaf cuts X's upstream RTP and the root removes X's mix-min
 
 ## Persistence model
 
-The migrations are applied by `/data/scripts/init-db.sh`:
+The migrations are applied by `/data/deploy/scripts/init-db.sh`:
 
 - `001_initial.sql`: operators, bridges, participants, call legs, dial batches, and node commands;
 - `002_room_delete_constraints.sql`: safe room deletion behavior, including the participant/batch-item foreign-key issue;
@@ -257,7 +282,7 @@ Without this outbox, a sidecar restart can lose its in-memory `PBXMemberID` look
 
 ## Service contracts in this tree
 
-### SipGo edge: `/data/sipgo-lb`
+### SipGo edge: `/data/components/phonarch-sip-gateway`
 
 - SIP UDP/TCP listener: `SIPGO_LISTEN` and `SIPGO_TCP_LISTEN`, normally private interface `:5060` mapped to a public SIP address.
 - Dynamic edge advertisement: `active-sipgo:<edge_id>` in Redis; `SIPGO_NODE_ID` is optional and otherwise derived from `SIPGO_ADVERTISE_IP`.
@@ -269,7 +294,7 @@ Without this outbox, a sidecar restart can lose its in-memory `PBXMemberID` look
 
 Supported edge methods are OPTIONS, INVITE, ACK, BYE, CANCEL, UPDATE, and INFO. INVITEs with a To-tag are treated as in-dialog re-INVITEs and are never selected as a new call.
 
-### PBX sidecar: `/data/sidecar`
+### PBX sidecar: `/data/components/phonarch-pbx-sidecar`
 
 The sidecar runs beside one RustPBX instance and is the only control boundary the API needs to know. It sends SIP OPTIONS and forwards commands to the local RustPBX HTTP control endpoint.
 
@@ -281,9 +306,9 @@ The sidecar runs beside one RustPBX instance and is the only control boundary th
 - `POST /v1/participants/{id}/drop`;
 - `POST /v1/rooms/{room_id}/media/{attach|publish|unpublish|subscribe|unsubscribe|failover}`.
 
-Every command should include an idempotency key, workspace ID, room ID, room epoch, and node epoch. The adapter contract is documented in [`rustpbx/ADAPTER_CONTRACT.md`](/data/rustpbx/ADAPTER_CONTRACT.md).
+Every command should include an idempotency key, workspace ID, room ID, room epoch, and node epoch. The adapter contract is documented in [`docs/RUSTPBX-ADAPTER-CONTRACT.md`](/data/docs/RUSTPBX-ADAPTER-CONTRACT.md).
 
-### Control API: `/data/control-api`
+### Control API: `/data/components/phonarch-platform-api`
 
 The API owns authenticated customer operations:
 
@@ -297,7 +322,7 @@ The API owns authenticated customer operations:
 
 The API binds to localhost by default. If it is exposed beyond the host, configure a real TLS/reverse-proxy boundary, a non-empty `PHONARCH_INTERNAL_TOKEN`, an explicit `UI_ORIGIN`, rate limits, and production identity/RBAC. The scaffold's admin username/password are lab credentials only.
 
-### UI: `/data/ui`
+### UI: `/data/components/phonarch-platform-web`
 
 The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icons. It contains:
 
@@ -309,13 +334,13 @@ The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icon
 - moderated speaker-request queue with Allow and Dismiss actions;
 - activity and room settings surfaces.
 
-The CSS variables and material rules are in `/data/ui/app/globals.css`: cool off-white background, frosted glass panels, mint gradients, green brand buttons, and the requested text/border/status tokens.
+The CSS variables and material rules are in `/data/components/phonarch-platform-web/src/app/globals.css`: cool off-white background, frosted glass panels, mint gradients, green brand buttons, and the requested text/border/status tokens.
 
 The canonical visual tokens are `--background: #f5f7f8`, `--surface: rgba(255,255,255,.86)`, `--surface-strong: rgba(255,255,255,.95)`, `--text-primary: #182732`, `--text-secondary: #43535e`, `--text-muted: #71808b`, `--border: rgba(38,56,68,.14)`, `--accent: #147b63`, `--accent-deep: #0d5c4b`, `--accent-soft: #e3f3ed`, `--accent-wash: #f0f8f5`, `--success: #347d59`, `--warning: #a76c32`, `--error: #a14d4d`, and `--info: #527daf`. Glass panels use an 18px backdrop blur, a 12px/34px cool shadow, and the specified translucent border. Brand actions use the mint-to-deep-green diagonal gradient. These are customer-operator surfaces, not media surfaces.
 
 ## RustPBX configuration
 
-`/data/rustpbx/config.toml` defines the production intent:
+`/data/components/phonarch-rustpbx/config.toml` defines the production intent:
 
 - listener/root role;
 - soft capacity 350 and hard capacity 500 for an initial four-CPU listener profile;
@@ -388,9 +413,9 @@ For the current x86_64 lab, native Go and Node toolchains are staged under `/dat
 ### Database
 
 ```bash
-cp /data/config/phonarch.env.example /data/config/phonarch.env
+cp /data/deploy/phonarch-conference.env.example /data/state/secrets/phonarch-conference.env
 # edit DATABASE_URL, credentials, SIP addresses, and UI origin
-/data/scripts/init-db.sh
+/data/deploy/scripts/init-db.sh
 ```
 
 The migration is additive and safe to rerun with the included `IF NOT EXISTS`/conflict guards. Back up PostgreSQL before applying it to a real environment.
@@ -398,28 +423,29 @@ The migration is additive and safe to rerun with the included `IF NOT EXISTS`/co
 ### Build
 
 ```bash
-/data/scripts/build.sh
+/data/deploy/scripts/build.sh
 ```
 
-The build detects the host architecture and emits binaries under `/data/build`:
+The build detects the host architecture and emits each binary in its owning
+component's `/data/components/<component>/bin` directory:
 
 - `sipgo-lb-linux-amd64` or `sipgo-lb-linux-arm64`;
 - `pbx-sidecar-linux-amd64` or `pbx-sidecar-linux-arm64`;
 - `control-api-linux-amd64`;
 - `rustpbx-heartbeat-*` and `mock-rustpbx-*`;
-- a Next.js standalone production bundle under `/data/ui/.next/standalone`.
+- a Next.js standalone production bundle under `/data/components/phonarch-platform-web/.next/standalone`.
 
 The Go module tests and `npm run build` are the minimum validation gate.
 
 ### Start and stop
 
 ```bash
-/data/scripts/start.sh
-/data/scripts/status.sh
-/data/scripts/stop.sh
+/data/deploy/scripts/start.sh
+/data/deploy/scripts/status.sh
+/data/deploy/scripts/stop.sh
 ```
 
-The local profile starts Redis, SipGo, two mock RustPBX nodes, two sidecars, the control API, and the UI. It does not start an external RustPBX unless `RUSTPBX_BIN` points to an executable. Runtime logs, PIDs, Redis data, and audit files live under `/data/runtime`.
+The local profile starts Redis, SipGo, two mock RustPBX nodes, two sidecars, the control API, and the UI. It does not start an external RustPBX unless `RUSTPBX_BIN` points to an executable. Runtime logs, PIDs, Redis data, and audit files live under `/data/state/runtime`.
 
 The launcher is list-driven. For example, the current two-NIC lab uses:
 
@@ -461,7 +487,7 @@ curl http://127.0.0.1:3000/login
 /data/toolchains/redis/usr/bin/redis-cli --scan --pattern 'active-pbx:*'
 ```
 
-The lab admin credentials come from `/data/config/phonarch.env`, not from the source code. Change them before any shared deployment.
+The lab admin credentials come from `/data/state/secrets/phonarch-conference.env`, not from the source code. Change them before any shared deployment.
 
 ## Production work remaining
 
@@ -482,11 +508,11 @@ The most important correctness rule is that workspace ID, room ID, room epoch, n
 
 ## Source map
 
-- [`sipgo-lb`](/data/sipgo-lb): SIP edge and Redis-backed routing.
-- [`control-api`](/data/control-api): authenticated room/call API and coordinator.
-- [`sidecar`](/data/sidecar): per-PBX control/heartbeat service.
-- [`rustpbx`](/data/rustpbx): node configs and adapter contract.
-- [`ui`](/data/ui): Next.js App Router conference console.
-- [`db`](/data/db): PostgreSQL migrations.
-- [`scripts`](/data/scripts): native build, database, start, stop, status, and audit runners.
-- [`config/phonarch.env.example`](/data/config/phonarch.env.example): environment contract.
+- [`phonarch-sip-gateway`](/data/components/phonarch-sip-gateway): SIP edge and Redis-backed routing.
+- [`phonarch-platform-api`](/data/components/phonarch-platform-api): authenticated room/call API, coordinator, and PostgreSQL migrations.
+- [`phonarch-pbx-sidecar`](/data/components/phonarch-pbx-sidecar): per-PBX control/heartbeat service.
+- [`phonarch-rustpbx`](/data/components/phonarch-rustpbx): node configs and adapter contract.
+- [`phonarch-platform-web`](/data/components/phonarch-platform-web): Next.js App Router conference console.
+- [`deploy`](/data/deploy): native build, database, start, stop, and status runners.
+- [`docs`](/data/docs): architecture and integration contracts.
+- [`deploy/phonarch-conference.env.example`](/data/deploy/phonarch-conference.env.example): environment contract.
