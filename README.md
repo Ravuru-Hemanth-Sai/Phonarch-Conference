@@ -76,6 +76,8 @@ The room is also the media-control and failure-fencing boundary. Media commands 
 12. The operator can mute, inspect volume, or drop a participant. Dropped calls remain in the roster and session history and can be added back on a later session.
 13. Stop Room releases active calls, closes the session, records end time/duration and the participants included, and returns the room to `READY`.
 
+Each room has a configurable default dialing region, `+91` by default. Operators can change it in Room settings before a session starts. Numbers entered without a leading `+` are normalized with that room region at dispatch time, while stored roster values remain editable in their original form.
+
 Room state is explicit: `READY -> STARTING -> RUNNING -> READY`. Host/roster edits and roster imports are rejected during `STARTING` or `RUNNING`, preventing a live session from silently changing membership. An ad-hoc live dialer exists inside Live control for exceptional callers; it creates a listener attached to the current room and is not a replacement for the fixed roster workflow.
 
 ## Protocol and deployment rules
@@ -259,6 +261,7 @@ The migrations are applied by `/data/deploy/scripts/init-db.sh`:
 - `002_room_delete_constraints.sql`: safe room deletion behavior, including the participant/batch-item foreign-key issue;
 - `003_multitenant_media_ha.sql`: workspaces, workspace membership, workspace foreign keys, media sessions, leaf assignments, speaker requests, room events, epochs, and command metadata;
 - `004_room_lifecycle_roster.sql`: room state, one fixed host, listener roles, durable room sessions, and per-session participant snapshots.
+- `005_room_dialing_region.sql`: room-level default dialing region with a constrained supported-region set.
 
 Important relationships:
 
@@ -338,6 +341,7 @@ The UI is Next.js App Router + TypeScript + Tailwind configuration + Lucide icon
 - workspace landing page with room cards and room deletion confirmation;
 - fixed host editor and editable participant roster;
 - direct SIP dialer plus live floating ad-hoc dialer;
+- room-scoped dialing region selection with `+91` as the default and live number normalization;
 - local XLSX/CSV preview using `Name`, `Phone Number`, and `Role`, with roster-only submission;
 - Start Room / Stop Room controls with host-first messaging;
 - full-height room sidebar;

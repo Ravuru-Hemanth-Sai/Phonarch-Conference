@@ -63,6 +63,10 @@ type session struct {
 	workspaceID string
 }
 
+var supportedDialRegions = map[string]struct{}{
+	"+1": {}, "+44": {}, "+61": {}, "+65": {}, "+91": {}, "+971": {},
+}
+
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -344,7 +348,7 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,name,status,room_state,COALESCE(host_name,''),COALESCE(host_phone,''),created_at FROM bridges WHERE workspace_id=$1 ORDER BY created_at DESC`, workspaceID)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id::text,name,status,room_state,COALESCE(host_name,''),COALESCE(host_phone,''),COALESCE(default_region,'+91'),created_at FROM bridges WHERE workspace_id=$1 ORDER BY created_at DESC`, workspaceID)
 		if err != nil {
 			a.json(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -352,10 +356,10 @@ func (a *api) bridges(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var id, name, status, roomState, hostName, hostPhone string
+			var id, name, status, roomState, hostName, hostPhone, defaultRegion string
 			var created time.Time
-			_ = rows.Scan(&id, &name, &status, &roomState, &hostName, &hostPhone, &created)
-			out = append(out, map[string]any{"id": id, "name": name, "status": status, "room_state": roomState, "host_name": hostName, "host_phone": hostPhone, "created_at": created})
+			_ = rows.Scan(&id, &name, &status, &roomState, &hostName, &hostPhone, &defaultRegion, &created)
+			out = append(out, map[string]any{"id": id, "name": name, "status": status, "room_state": roomState, "host_name": hostName, "host_phone": hostPhone, "default_region": normalizeDialRegion(defaultRegion), "created_at": created})
 		}
 		a.json(w, 200, out)
 	case http.MethodPost:
@@ -404,6 +408,10 @@ func (a *api) bridge(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "host" && (r.Method == http.MethodPut || r.Method == http.MethodDelete) {
 		a.host(w, r, workspaceID, bridgeID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "settings" && r.Method == http.MethodPut {
+		a.bridgeSettings(w, r, workspaceID, bridgeID)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "participants" && r.Method == http.MethodPost {
@@ -485,8 +493,8 @@ func (a *api) deleteBridge(w http.ResponseWriter, r *http.Request, workspaceID, 
 }
 
 func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
-	var roomState, hostName, hostPhone string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,'') FROM bridges WHERE id=$1 AND workspace_id=$2`, id, workspaceID).Scan(&roomState, &hostName, &hostPhone); err != nil {
+	var roomState, hostName, hostPhone, defaultRegion string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state,COALESCE(host_name,''),COALESCE(host_phone,''),COALESCE(default_region,'+91') FROM bridges WHERE id=$1 AND workspace_id=$2`, id, workspaceID).Scan(&roomState, &hostName, &hostPhone, &defaultRegion); err != nil {
 		if err == sql.ErrNoRows {
 			a.json(w, 404, map[string]string{"error": "room not found"})
 			return
@@ -534,7 +542,7 @@ func (a *api) bridgeState(w http.ResponseWriter, r *http.Request, workspaceID, i
 			requests = append(requests, map[string]any{"id": requestID, "participant_id": participantID, "status": requestStatus, "digit": digit, "requested_at": requestedAt, "granted_by": grantedBy})
 		}
 	}
-	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "room_state": roomState, "host": map[string]string{"name": hostName, "phone_number": hostPhone}, "participants": out, "speaker_requests": requests, "sessions": a.sessionRows(r.Context(), workspaceID, id)})
+	a.json(w, 200, map[string]any{"workspace_id": workspaceID, "bridge_id": id, "room_state": roomState, "default_region": normalizeDialRegion(defaultRegion), "host": map[string]string{"name": hostName, "phone_number": hostPhone}, "participants": out, "speaker_requests": requests, "sessions": a.sessionRows(r.Context(), workspaceID, id)})
 }
 
 func (a *api) sessionRows(ctx context.Context, workspaceID, bridgeID string) []map[string]any {
@@ -629,6 +637,39 @@ func (a *api) host(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID
 		return
 	}
 	a.json(w, 200, map[string]any{"status": "saved", "bridge_id": bridgeID, "host": map[string]string{"participant_id": hostID, "name": in.Name, "phone_number": in.Phone}})
+}
+
+func (a *api) bridgeSettings(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
+	var in struct {
+		DefaultRegion string `json:"default_region"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		a.json(w, http.StatusBadRequest, map[string]string{"error": "invalid settings payload"})
+		return
+	}
+	region := normalizeDialRegion(in.DefaultRegion)
+	if strings.TrimSpace(in.DefaultRegion) != "" && region != strings.TrimSpace(in.DefaultRegion) {
+		a.json(w, http.StatusBadRequest, map[string]string{"error": "unsupported default_region"})
+		return
+	}
+	var roomState string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT room_state FROM bridges WHERE id=$1 AND workspace_id=$2`, bridgeID, workspaceID).Scan(&roomState); err != nil {
+		if err == sql.ErrNoRows {
+			a.json(w, http.StatusNotFound, map[string]string{"error": "room not found"})
+			return
+		}
+		a.json(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if roomState == "RUNNING" || roomState == "STARTING" {
+		a.json(w, http.StatusConflict, map[string]string{"error": "stop the room before changing its dialing region"})
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE bridges SET default_region=$1,updated_at=now() WHERE id=$2 AND workspace_id=$3`, region, bridgeID, workspaceID); err != nil {
+		a.json(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.json(w, http.StatusOK, map[string]any{"status": "saved", "bridge_id": bridgeID, "default_region": region})
 }
 
 func (a *api) addRosterParticipant(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
@@ -879,10 +920,46 @@ func normalizeParticipantRole(role string) string {
 	return "LISTENER"
 }
 
+func normalizeDialRegion(region string) string {
+	region = strings.TrimSpace(region)
+	if _, ok := supportedDialRegions[region]; ok {
+		return region
+	}
+	return "+91"
+}
+
+func normalizeDialNumber(phone, region string) string {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return ""
+	}
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phone)
+	if digits == "" {
+		return ""
+	}
+	if strings.HasPrefix(phone, "+") {
+		return "+" + digits
+	}
+	digits = strings.TrimLeft(digits, "0")
+	if digits == "" {
+		return ""
+	}
+	return normalizeDialRegion(region) + digits
+}
+
 func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, bridgeID, participantID, sessionID string) (map[string]any, error) {
-	var name, phone, role string
-	if err := a.db.QueryRowContext(ctx, `SELECT display_name,phone_number,COALESCE(role,'LISTENER') FROM participants WHERE id=$1 AND workspace_id=$2 AND bridge_id=$3`, participantID, workspaceID, bridgeID).Scan(&name, &phone, &role); err != nil {
+	var name, phone, role, defaultRegion string
+	if err := a.db.QueryRowContext(ctx, `SELECT p.display_name,p.phone_number,COALESCE(p.role,'LISTENER'),COALESCE(b.default_region,'+91') FROM participants p JOIN bridges b ON b.id=p.bridge_id AND b.workspace_id=p.workspace_id WHERE p.id=$1 AND p.workspace_id=$2 AND p.bridge_id=$3`, participantID, workspaceID, bridgeID).Scan(&name, &phone, &role, &defaultRegion); err != nil {
 		return nil, err
+	}
+	dialNumber := normalizeDialNumber(phone, defaultRegion)
+	if dialNumber == "" {
+		return nil, errors.New("participant phone number is invalid")
 	}
 	role = normalizeParticipantRole(role)
 	nodes, err := a.nodes(ctx)
@@ -899,7 +976,7 @@ func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, brid
 		return nil, err
 	}
 	command := newID()
-	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": phone, "role": role, "desired_mute": desiredMute}
+	body := map[string]any{"command_id": command, "call_id": callID, "bridge_id": bridgeID, "participant_id": participantID, "destination": dialNumber, "role": role, "desired_mute": desiredMute}
 	if err := a.sidecar(ctx, n, "/v1/calls/originate", body); err != nil {
 		_, _ = a.db.ExecContext(ctx, `UPDATE call_legs SET state='FAILED',last_error=$1,ended_at=now(),updated_at=now() WHERE id=$2`, err.Error(), callID)
 		return nil, err
@@ -910,7 +987,7 @@ func (a *api) dispatchExistingParticipant(ctx context.Context, workspaceID, brid
 	}
 	_, _ = a.db.ExecContext(ctx, `UPDATE participants SET desired_state=$1 WHERE id=$2 AND workspace_id=$3`, participantState, participantID, workspaceID)
 	if sessionID != "" {
-		_, _ = a.db.ExecContext(ctx, `INSERT INTO room_session_participants(session_id,participant_id,call_leg_id,display_name,phone_number,role,call_state) VALUES($1,$2,$3,$4,$5,$6,'DISPATCHED')`, sessionID, participantID, callID, name, phone, role)
+		_, _ = a.db.ExecContext(ctx, `INSERT INTO room_session_participants(session_id,participant_id,call_leg_id,display_name,phone_number,role,call_state) VALUES($1,$2,$3,$4,$5,$6,'DISPATCHED')`, sessionID, participantID, callID, name, dialNumber, role)
 	}
 	return map[string]any{"participant_id": participantID, "call_id": callID, "node_id": n.NodeID, "role": role, "state": "DISPATCHED"}, nil
 }
@@ -932,12 +1009,20 @@ func (a *api) dispatchDial(ctx context.Context, workspaceID, bridgeID, name, pho
 
 func (a *api) dial(w http.ResponseWriter, r *http.Request, workspaceID, bridgeID string) {
 	var in struct {
-		Name  string `json:"name"`
-		Phone string `json:"phone_number"`
+		Name   string `json:"name"`
+		Phone  string `json:"phone_number"`
+		Region string `json:"region"`
 	}
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Phone == "" {
 		a.json(w, 400, map[string]string{"error": "phone_number required"})
 		return
+	}
+	if strings.TrimSpace(in.Region) != "" {
+		in.Phone = normalizeDialNumber(in.Phone, in.Region)
+		if in.Phone == "" {
+			a.json(w, http.StatusBadRequest, map[string]string{"error": "phone_number is invalid"})
+			return
+		}
 	}
 	result, err := a.dispatchDial(r.Context(), workspaceID, bridgeID, in.Name, in.Phone)
 	if err != nil {

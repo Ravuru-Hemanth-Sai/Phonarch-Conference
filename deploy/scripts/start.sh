@@ -145,5 +145,6 @@ for index in "${!CORE_PRIVATE_IPS[@]}"; do
 done
 
 export NEXT_PUBLIC_CONTROL_API_URL="${NEXT_PUBLIC_CONTROL_API_URL-}"
-start_bg ui bash -lc "cd '$COMPONENTS_ROOT/phonarch-platform-web' && PORT='${UI_PORT:-3000}' HOSTNAME='0.0.0.0' node .next/standalone/server.js"
+UI_NODE_BIN="$(command -v node)"
+start_bg ui env PORT="${UI_PORT:-3000}" HOSTNAME="0.0.0.0" "$UI_NODE_BIN" "$COMPONENTS_ROOT/phonarch-platform-web/.next/standalone/server.js"
 log "PhonArch services started; inspect $RUNTIME/logs and run /data/deploy/scripts/status.sh"
