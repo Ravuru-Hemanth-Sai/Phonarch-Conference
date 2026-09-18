@@ -1843,17 +1843,31 @@ func (a *api) adminCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		a.json(w, 400, map[string]string{"error": "max_participants must be between 1 and 100000"})
 		return
 	}
-	slug := slugify(in.Slug)
-	if slug == "" {
-		slug = slugify(in.Name)
+	baseSlug := slugify(in.Slug)
+	if baseSlug == "" {
+		baseSlug = slugify(in.Name)
 	}
-	var id string
-	err := a.db.QueryRowContext(r.Context(), `INSERT INTO workspaces(slug,name,max_participants) VALUES($1,$2,$3) RETURNING id::text`, slug, strings.TrimSpace(in.Name), in.MaxParticipants).Scan(&id)
-	if err != nil {
-		a.json(w, http.StatusConflict, map[string]string{"error": "workspace slug already exists or limit is invalid"})
-		return
+	if baseSlug == "" {
+		baseSlug = "workspace"
 	}
-	a.json(w, http.StatusCreated, map[string]any{"id": id, "slug": slug, "name": strings.TrimSpace(in.Name), "max_participants": in.MaxParticipants, "status": "ACTIVE"})
+	workspaceName := strings.TrimSpace(in.Name)
+	var id, slug string
+	for suffix := 1; suffix <= 1000; suffix++ {
+		slug = baseSlug
+		if suffix > 1 {
+			slug = fmt.Sprintf("%s-%d", baseSlug, suffix)
+		}
+		err := a.db.QueryRowContext(r.Context(), `INSERT INTO workspaces(slug,name,max_participants) VALUES($1,$2,$3) ON CONFLICT (slug) DO NOTHING RETURNING id::text`, slug, workspaceName, in.MaxParticipants).Scan(&id)
+		if err == nil {
+			a.json(w, http.StatusCreated, map[string]any{"id": id, "slug": slug, "name": workspaceName, "max_participants": in.MaxParticipants, "status": "ACTIVE"})
+			return
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			a.json(w, http.StatusInternalServerError, map[string]string{"error": "workspace could not be created"})
+			return
+		}
+	}
+	a.json(w, http.StatusConflict, map[string]string{"error": "workspace name is already in use too many times"})
 }
 
 func (a *api) adminUpdateWorkspace(w http.ResponseWriter, r *http.Request, workspaceID string) {

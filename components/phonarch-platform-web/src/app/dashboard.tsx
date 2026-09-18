@@ -382,11 +382,11 @@ export function Dashboard({ adminMode = false }: { adminMode?: boolean }) {
     }
   }
 
-  async function createWorkspace(name: string, slug: string) {
+  async function createWorkspace(name: string) {
     try {
       const created = await request<WorkspaceOption>("/api/v1/admin/workspaces", {
         method: "POST",
-        body: JSON.stringify({ name, slug }),
+        body: JSON.stringify({ name }),
       });
       setWorkspaceCreateOpen(false);
       await loadAdminWorkspaces();
@@ -453,7 +453,7 @@ export function Dashboard({ adminMode = false }: { adminMode?: boolean }) {
       {view === "settings" && <SettingsPage identity={identity} adminMode={adminMode} workspaces={adminWorkspaces} selectedWorkspaceID={selectedWorkspaceID} onWorkspaceCreated={() => void loadAdminWorkspaces()} />}
     </main>
     {createOpen && <CreateRoomModal onClose={() => setCreateOpen(false)} onCreate={(name) => void createRoom(name)} />}
-    {workspaceCreateOpen && <CreateWorkspaceModal onClose={() => setWorkspaceCreateOpen(false)} onCreate={(name, slug) => void createWorkspace(name, slug)} />}
+    {workspaceCreateOpen && <CreateWorkspaceModal onClose={() => setWorkspaceCreateOpen(false)} onCreate={(name) => void createWorkspace(name)} />}
     {deleteTarget && <DeleteRoomModal room={deleteTarget} error={deleteError} busy={deleteBusy} onClose={() => { if (!deleteBusy) { setDeleteTarget(null); setDeleteError(""); } }} onConfirm={() => void deleteRoom(deleteTarget.id, deleteTarget.name)} />}
   </div>;
 }
@@ -1045,10 +1045,9 @@ function PolicyRow({ icon: Icon, title, value, detail }: { icon: LucideIcon; tit
   return <div className="policy-row"><span className="policy-icon"><Icon size={15} /></span><span><strong>{title}</strong><small>{detail}</small></span><b>{value}</b><Check size={14} className="policy-check" /></div>;
 }
 
-function CreateWorkspaceModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string, slug: string) => void }) {
+function CreateWorkspaceModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string) => void }) {
   const [name, setName] = useState("");
-  const [slug, setSlug] = useState("");
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="modal-card workspace-create-modal" onSubmit={(event) => { event.preventDefault(); if (name.trim()) onCreate(name.trim(), slug.trim()); }}><div className="modal-heading"><div><div className="eyebrow">Product administration</div><h2>Create workspace</h2><p className="subtle">Create an isolated customer boundary for rooms, users, telephony, and call history.</p></div><IconButton title="Close" onClick={onClose}><X size={16} /></IconButton></div><div className="workspace-create-fields"><label className="field-label">Workspace name<input className="field-control" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. North region operations" required /></label><label className="field-label">Workspace slug <span>Optional</span><input className="field-control" value={slug} onChange={(event) => setSlug(event.target.value)} placeholder="north-region" /></label></div><div className="modal-footer"><span><ShieldCheck size={14} /> Workspace users and rooms remain isolated</span><div><button type="button" className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" disabled={!name.trim()}><Building2 size={15} /> Create workspace</button></div></div></form></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="modal-card workspace-create-modal" onSubmit={(event) => { event.preventDefault(); if (name.trim()) onCreate(name.trim()); }}><div className="modal-heading"><div><div className="eyebrow">Product administration</div><h2>Create workspace</h2><p className="subtle">Create an isolated customer boundary for rooms, users, telephony, and call history.</p></div><IconButton title="Close" onClick={onClose}><X size={16} /></IconButton></div><label className="field-label">Workspace name<input className="field-control" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. North region operations" required /></label><div className="workspace-auto-id"><span className="workspace-auto-id-mark"><Sparkles size={14} /></span><span><strong>Workspace identity is generated automatically</strong><small>We create the internal workspace address from this name. You can focus on the customer-facing name.</small></span></div><div className="modal-footer"><span><ShieldCheck size={14} /> Workspace users and rooms remain isolated</span><div><button type="button" className="button ghost" onClick={onClose}>Cancel</button><button className="button primary" disabled={!name.trim()}><Building2 size={15} /> Create workspace</button></div></div></form></div>;
 }
 
 function CreateRoomModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string) => void }) {
