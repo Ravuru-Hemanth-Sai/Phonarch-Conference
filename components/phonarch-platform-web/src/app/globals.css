@@ -543,3 +543,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .tfn-phone-composite { grid-template-columns: minmax(96px, .55fr) minmax(0, 1.45fr); }
   .region-selector-popover { width: min(290px, calc(100vw - 50px)); }
 }
+
+@media (max-width: 700px) {
+  .topbar-brand { width: auto; height: 34px; gap: 6px; }
+  .topbar-brand > span:last-child { display: grid; }
+  .topbar-brand strong { font-size: 12px; }
+  .topbar-brand small { font-size: 7px; }
+}
