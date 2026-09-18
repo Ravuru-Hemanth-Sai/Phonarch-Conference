@@ -504,3 +504,30 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .control-panel .empty-state { min-height: 190px; padding: 20px 10px; }
   .room-activity-panel .empty-state { min-height: 190px; padding: 20px 10px; }
 }
+
+/* Shared country/E.164 selector used by room dialing and room caller identity. */
+.region-selector { position: relative; min-width: 0; }
+.region-selector-trigger { display: flex; align-items: center; width: 100%; min-height: 44px; gap: 10px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 12px; color: var(--text-primary); background: rgba(255,255,255,.76); text-align: left; transition: .18s ease; }
+.region-selector-trigger:hover, .region-selector-trigger.open, .region-selector-trigger:focus-visible { border-color: rgba(20,123,99,.38); background: var(--surface-strong); box-shadow: 0 0 0 4px rgba(20,123,99,.08); outline: 0; }
+.region-selector-trigger:disabled { cursor: not-allowed; opacity: .65; }
+.region-selector-code { display: inline-flex; align-items: center; justify-content: center; min-width: 52px; height: 30px; padding: 0 8px; border-radius: 9px; color: var(--accent-deep); background: var(--accent-soft); font-size: 11px; font-weight: 800; }
+.region-selector-copy, .region-selector-option-copy { display: grid; min-width: 0; gap: 2px; }
+.region-selector-copy { flex: 1; }
+.region-selector-copy strong, .region-selector-option-copy strong { overflow: hidden; color: var(--text-secondary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.region-selector-copy small, .region-selector-option-copy small { color: var(--text-muted); font-size: 8px; }
+.region-selector-chevron { flex: 0 0 auto; color: var(--text-muted); }
+.region-selector-popover { position: absolute; z-index: 90; top: calc(100% + 8px); left: 0; width: min(290px, calc(100vw - 40px)); display: grid; gap: 4px; padding: 8px; border: 1px solid rgba(255,255,255,.94); border-radius: 14px; background: rgba(255,255,255,.97); box-shadow: 0 19px 45px rgba(31,51,62,.15); backdrop-filter: blur(20px); }
+.region-selector-option { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 44px; padding: 8px 9px; border: 1px solid transparent; border-radius: 10px; color: var(--text-secondary); background: transparent; text-align: left; }
+.region-selector-option:hover, .region-selector-option.active { border-color: rgba(20,123,99,.16); color: var(--accent-deep); background: var(--accent-wash); }
+.region-selector-option-copy { flex: 1; }
+.region-selector-option > svg { flex: 0 0 auto; color: var(--accent); }
+.tfn-phone-composite { grid-template-columns: minmax(175px, .9fr) minmax(0, 1.1fr); }
+.tfn-phone-composite .region-selector-trigger { min-height: 44px; }
+.room-region-card { position: relative; z-index: 12; }
+.admin-room-policy-panel { position: relative; z-index: 11; }
+.host-panel, .roster-panel { position: relative; z-index: 1; }
+
+@media (max-width: 700px) {
+  .tfn-phone-composite { grid-template-columns: 1fr; }
+  .region-selector-popover { width: min(290px, calc(100vw - 50px)); }
+}
