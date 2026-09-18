@@ -460,3 +460,47 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .room-settings-grid .roster-add-form { grid-template-columns: 1fr; }
   .room-settings-grid .roster-add-form .button { width: fit-content; }
 }
+
+/* Keep labels with helper text aligned to the same control row. The label's
+   content height must not move its neighbouring input down. */
+.room-settings-grid .admin-room-policy-form,
+.room-settings-grid .host-form { align-items: start; }
+.room-settings-grid .admin-room-policy-form > .button { align-self: start; margin-top: 24px; }
+
+@media (max-width: 700px) {
+  .room-settings-grid .admin-room-policy-form > .button { margin-top: 0; }
+}
+
+/* Compact mobile header: preserve each control as a deliberate touch target
+   instead of allowing the brand and workspace switcher to collide. */
+@media (max-width: 700px) {
+  .topbar { gap: 8px; overflow: visible; }
+  .topbar-left { flex: 0 0 auto; gap: 0; }
+  .topbar-brand { width: 34px; height: 34px; justify-content: center; }
+  .topbar-brand > span:last-child,
+  .topbar-left .breadcrumbs,
+  .topbar-caption { display: none; }
+  .topbar-actions { flex: 1 1 auto; min-width: 0; justify-content: flex-end; gap: 3px; }
+  .workspace-switcher { min-width: 0; flex: 1 1 auto; }
+  .workspace-trigger { width: 100%; max-width: 150px; min-width: 0; gap: 6px; padding: 5px 6px; }
+  .workspace-trigger-copy { max-width: 72px; }
+  .topbar-settings { width: 32px; height: 32px; justify-content: center; padding: 0; }
+  .topbar-actions > .icon-button { flex: 0 0 32px; }
+  .user-chip { gap: 4px; margin-left: 0; padding-left: 4px; }
+}
+
+@media (max-width: 700px) {
+  .room-sidebar { padding: 14px 15px 12px; }
+  .room-sidebar-heading { margin: 15px 8px 13px; }
+  .room-rail-nav { gap: 11px; }
+  .room-sidebar-section { gap: 5px; }
+  .room-sidebar-section > div { gap: 4px; }
+  .room-rail-nav > .room-sidebar-section:first-child > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .room-sidebar-footer { margin: 14px 4px 4px; padding-top: 9px; }
+}
+
+@media (max-width: 700px) {
+  .control-panel { padding: 18px; }
+  .control-panel .empty-state { min-height: 190px; padding: 20px 10px; }
+  .room-activity-panel .empty-state { min-height: 190px; padding: 20px 10px; }
+}
